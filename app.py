@@ -130,6 +130,24 @@ def get_highlights():
     return fetch_all_rows("highlights", "*")
 
 
+@st.cache_data(ttl=300)
+def get_bowling_deliveries():
+    """
+    Deliveries at bowler grain — just enough columns to count legal balls
+    bowled per bowler and join to matches for the grade filter.
+    """
+    return fetch_all_rows(
+        "deliveries",
+        "bowler_id, bowler, match_id, wides",
+    )
+
+
+@st.cache_data(ttl=300)
+def get_player_style():
+    """Full player_style table (batter_hand, pace_spin, bowl_hand, bowl_style)."""
+    return fetch_all_rows("player_style", "*")
+
+
 def add_season_column(df: pd.DataFrame, date_col: str = "day_1_start") -> pd.DataFrame:
     """
     Add season column with July–June seasons, formatted as 'YYYY/YYYY'.
@@ -715,6 +733,216 @@ def batting_tab():
                         st.info("No video URL available for this highlight.")
 
 
+# ---------- Bowler Style tab ----------
+
+PACE_SPIN_OPTIONS = ["Pace", "Spin"]
+BOWL_HAND_OPTIONS = ["Right", "Left"]
+BOWL_STYLE_OPTIONS = ["Right Pace", "Left Pace", "LAOS", "Off Spin", "Leg Spin"]
+
+
+def bowler_style_tab():
+    st.header("Bowler Style")
+    st.caption(
+        "Identify bowlers with missing style data, and set pace/spin, "
+        "bowling hand, and bowling style directly against each bowler."
+    )
+
+    deliveries_df = get_bowling_deliveries()
+    if deliveries_df.empty:
+        st.info("No delivery data available.")
+        return
+
+    matches_df = get_matches()
+    deliveries_df = deliveries_df.merge(
+        matches_df[["match_id", "grade"]], on="match_id", how="left"
+    )
+
+    style_df = get_player_style()
+
+    # ---- Filters ----
+    filt_col1, filt_col2 = st.columns([2, 1])
+    with filt_col1:
+        grade_options = sorted(deliveries_df["grade"].dropna().unique().tolist())
+        selected_grade = st.multiselect(
+            "Grade", grade_options, default=[], key="bowler_filter_grade"
+        )
+    with filt_col2:
+        style_status = st.selectbox(
+            "Bowl style",
+            ["All", "Populated", "Unpopulated"],
+            key="bowler_filter_style_status",
+        )
+
+    d_filtered = deliveries_df.copy()
+    if selected_grade:
+        d_filtered = d_filtered[d_filtered["grade"].isin(selected_grade)]
+
+    # Legal deliveries only (same convention as the batting tab's ball segments)
+    d_filtered["wides"] = d_filtered["wides"].fillna(0)
+    d_filtered = d_filtered[d_filtered["wides"] == 0]
+    d_filtered = d_filtered[d_filtered["bowler_id"].notna()]
+
+    if d_filtered.empty:
+        st.info("No bowling deliveries match the current filters.")
+        return
+
+    bowler_summary = d_filtered.groupby("bowler_id").agg(
+        bowler_name=("bowler", "first"),
+        balls=("bowler_id", "count"),
+    ).reset_index()
+
+    bowler_summary = bowler_summary.merge(
+        style_df, left_on="bowler_id", right_on="player_id", how="left"
+    )
+    bowler_summary["bowl_style_populated"] = (
+        bowler_summary["bowl_style"].notna() & (bowler_summary["bowl_style"] != "")
+    )
+
+    if style_status == "Populated":
+        bowler_summary = bowler_summary[bowler_summary["bowl_style_populated"]]
+    elif style_status == "Unpopulated":
+        bowler_summary = bowler_summary[~bowler_summary["bowl_style_populated"]]
+
+    bowler_summary = bowler_summary.sort_values("balls", ascending=False).reset_index(drop=True)
+
+    if bowler_summary.empty:
+        st.info("No bowlers match the current filters.")
+        return
+
+    st.caption(f"{len(bowler_summary)} bowlers")
+
+    # Option lists: the fixed standard values, plus anything already in the
+    # data (in case older/other values are present) so nothing gets hidden.
+    pace_spin_opts = sorted(set(PACE_SPIN_OPTIONS) | set(style_df["pace_spin"].dropna().unique().tolist()))
+    bowl_hand_opts = sorted(set(BOWL_HAND_OPTIONS) | set(style_df["bowl_hand"].dropna().unique().tolist()))
+    bowl_style_opts = sorted(set(BOWL_STYLE_OPTIONS) | set(style_df["bowl_style"].dropna().unique().tolist()))
+
+    if (
+        "selected_bowler_id" not in st.session_state
+        or st.session_state["selected_bowler_id"] not in bowler_summary["bowler_id"].values
+    ):
+        st.session_state["selected_bowler_id"] = bowler_summary.iloc[0]["bowler_id"]
+
+    def _dropdown_index(options, current_value):
+        full_options = ["–"] + options
+        if pd.notna(current_value) and current_value in options:
+            return full_options.index(current_value)
+        return 0
+
+    with st.container(height=480):
+        for _, row in bowler_summary.iterrows():
+            bid = row["bowler_id"]
+            c_name, c_ps, c_hand, c_style, c_save, c_select = st.columns([2, 1, 1, 1, 1, 1])
+
+            with c_name:
+                st.markdown(f"**{row['bowler_name']}**  \n{int(row['balls'])} balls")
+            with c_ps:
+                ps_val = st.selectbox(
+                    "Pace/Spin", ["–"] + pace_spin_opts,
+                    index=_dropdown_index(pace_spin_opts, row.get("pace_spin")),
+                    key=f"ps_{bid}", label_visibility="collapsed",
+                )
+            with c_hand:
+                hand_val = st.selectbox(
+                    "Hand", ["–"] + bowl_hand_opts,
+                    index=_dropdown_index(bowl_hand_opts, row.get("bowl_hand")),
+                    key=f"hand_{bid}", label_visibility="collapsed",
+                )
+            with c_style:
+                style_val = st.selectbox(
+                    "Style", ["–"] + bowl_style_opts,
+                    index=_dropdown_index(bowl_style_opts, row.get("bowl_style")),
+                    key=f"style_{bid}", label_visibility="collapsed",
+                )
+            with c_save:
+                if st.button("💾 Save", key=f"save_{bid}"):
+                    payload = {
+                        "player_id": str(bid),
+                        "pace_spin": None if ps_val == "–" else ps_val,
+                        "bowl_hand": None if hand_val == "–" else hand_val,
+                        "bowl_style": None if style_val == "–" else style_val,
+                    }
+                    try:
+                        supabase.table("player_style").upsert(
+                            payload, on_conflict="player_id"
+                        ).execute()
+                        st.success(f"Saved {row['bowler_name']}")
+                        get_player_style.clear()
+                    except Exception as e:
+                        st.error(f"Save failed: {e}")
+            with c_select:
+                if st.button("Highlights", key=f"sel_{bid}"):
+                    st.session_state["selected_bowler_id"] = bid
+
+            st.divider()
+
+    # ---- Highlights panel for the selected bowler ----
+    selected_row = bowler_summary[
+        bowler_summary["bowler_id"] == st.session_state["selected_bowler_id"]
+    ].iloc[0]
+    st.subheader(f"Highlights — {selected_row['bowler_name']}")
+
+    highlights_df = get_highlights()
+    bowler_highlights = highlights_df[
+        highlights_df["bowler_id"] == str(selected_row["bowler_id"])
+    ].copy()
+
+    if bowler_highlights.empty:
+        st.info("No highlights available for this bowler.")
+        return
+
+    bowler_highlights = bowler_highlights.merge(
+        matches_df[["match_id", "day_1_start"]], on="match_id", how="left"
+    )
+    bh_sorted = bowler_highlights.sort_values(
+        ["day_1_start", "innings_number", "over", "ball_number"],
+        ascending=[False, True, True, True],
+    ).reset_index(drop=True)
+
+    if (
+        "selected_bowler_highlight_id" not in st.session_state
+        or st.session_state["selected_bowler_highlight_id"] not in bh_sorted["highlight_id"].values
+    ):
+        st.session_state["selected_bowler_highlight_id"] = bh_sorted.iloc[0]["highlight_id"]
+
+    # Equal columns so the video takes up roughly half the screen width
+    list_col, video_col = st.columns(2)
+
+    with list_col:
+        st.caption(f"{len(bh_sorted)} highlights — tap ▶ to play")
+        with st.container(height=400):
+            for _, hrow in bh_sorted.iterrows():
+                hid = hrow["highlight_id"]
+                txt_col, btn_col = st.columns([5, 1])
+                with txt_col:
+                    date_str = (
+                        hrow["day_1_start"].strftime("%d %b %Y")
+                        if pd.notna(hrow.get("day_1_start"))
+                        else ""
+                    )
+                    st.markdown(
+                        f"**{hrow.get('batter', '')}** — {hrow.get('highlight_type', '')}  \n"
+                        f"{hrow.get('description', '')}  \n"
+                        f"<span style='color:gray;font-size:0.8em'>{date_str}</span>",
+                        unsafe_allow_html=True,
+                    )
+                with btn_col:
+                    if st.button("▶", key=f"bowlerhl_play_{hid}"):
+                        st.session_state["selected_bowler_highlight_id"] = hid
+                st.divider()
+
+    with video_col:
+        sel_h = bh_sorted[
+            bh_sorted["highlight_id"] == st.session_state["selected_bowler_highlight_id"]
+        ].iloc[0]
+        st.markdown(f"**{sel_h.get('description', '')}**")
+        url = sel_h.get("highlight_url")
+        if url:
+            st.video(url, autoplay=True)
+        else:
+            st.info("No video URL available for this highlight.")
+
+
 # ---------- Bowling tab (placeholder) ----------
 
 def bowling_tab():
@@ -733,7 +961,7 @@ def team_tab():
 
 st.title("PlayCricket Dashboard")
 
-tabs = st.tabs(["Batting", "Bowling", "Team"])
+tabs = st.tabs(["Batting", "Bowling", "Bowler Style", "Team"])
 
 with tabs[0]:
     batting_tab()
@@ -742,4 +970,7 @@ with tabs[1]:
     bowling_tab()
 
 with tabs[2]:
+    bowler_style_tab()
+
+with tabs[3]:
     team_tab()
