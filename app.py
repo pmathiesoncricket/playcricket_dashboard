@@ -542,10 +542,15 @@ def batting_tab():
             innings=("runs", "count"),
             runs=("runs", "sum"),
             balls=("balls_faced", "sum"),
+            dismissals=("dismissal_type", lambda x: x.notna().sum()),
             fours=("fours", "sum"),
             sixes=("sixes", "sum"),
         ).reset_index()
 
+        pos["average"] = pos.apply(
+            lambda r: r["runs"] / r["dismissals"] if r["dismissals"] > 0 else None,
+            axis=1,
+        )
         pos["strike_rate"] = pos.apply(
             lambda r: 100 * r["runs"] / r["balls"] if r["balls"] > 0 else None,
             axis=1,
@@ -561,6 +566,9 @@ def batting_tab():
         )
 
         pos_display = pos.copy()
+        pos_display["average"] = pos_display["average"].apply(
+            lambda x: f"{x:.2f}" if pd.notna(x) else "–"
+        )
         pos_display["strike_rate"] = pos_display["strike_rate"].apply(
             lambda x: f"{x:.0f}" if pd.notna(x) else "–"
         )
@@ -571,7 +579,13 @@ def batting_tab():
             lambda x: f"{x:.2f}" if pd.notna(x) else "–"
         )
 
-        st.dataframe(pos_display.sort_values("bat_position"), use_container_width=True)
+        st.dataframe(
+            pos_display[
+                ["bat_position", "innings", "runs", "average", "strike_rate",
+                 "fours_per_100_balls", "sixes_per_100_balls", "dismissals", "fours", "sixes"]
+            ].sort_values("bat_position"),
+            use_container_width=True,
+        )
 
         # Highlights viewer
         st.subheader("Highlights viewer")
@@ -621,20 +635,45 @@ def batting_tab():
 
             h_filtered = h_filtered[h_filtered.apply(highlight_type_filter, axis=1)]
 
-            # Show a table plus embedded videos
-            st.dataframe(
-                h_filtered[
-                    ["batter", "bowler", "highlight_type", "metrics", "description", "highlight_url"]
-                ],
-                use_container_width=True,
-            )
+            if h_filtered.empty:
+                st.info("No highlights match the current filters.")
+            else:
+                # Sort: most recent match first, then chronological order within the match
+                h_sorted = h_filtered.sort_values(
+                    ["day_1_start", "innings_number", "over", "ball_number"],
+                    ascending=[False, True, True, True],
+                ).reset_index(drop=True)
 
-            for _, row in h_filtered.head(10).iterrows():
-                st.markdown(f"**{row.get('description', '')}**")
-                url = row.get("highlight_url")
+                h_top10 = h_sorted.head(10).reset_index(drop=True)
+
+                st.caption("Click a row to load it in the player below.")
+
+                event = st.dataframe(
+                    h_top10[
+                        ["batter", "bowler", "highlight_type", "metrics", "description"]
+                    ],
+                    use_container_width=True,
+                    height=300,  # forces a scrollbar within the top-10 list
+                    hide_index=True,
+                    on_select="rerun",
+                    selection_mode="single-row",
+                    key="highlights_table_select",
+                )
+
+                selected_rows = (
+                    event.selection.rows
+                    if event and getattr(event, "selection", None)
+                    else []
+                )
+                selected_idx = selected_rows[0] if selected_rows else 0
+                selected_highlight = h_top10.iloc[selected_idx]
+
+                st.markdown(f"**{selected_highlight.get('description', '')}**")
+                url = selected_highlight.get("highlight_url")
                 if url:
-                    st.video(url)
-                st.write("---")
+                    st.video(url, autoplay=True)
+                else:
+                    st.info("No video URL available for this highlight.")
 
 
 # ---------- Bowling tab (placeholder) ----------
