@@ -70,7 +70,7 @@ def get_matches():
 def get_batting_innings():
     """
     player_innings for role='batting', joined to matches for grade/match_type/date/opponent,
-    and joined to player_style for bowling type (pace_spin).
+    and joined to player_style for bowling type (pace_spin) and bowling style (bowl_style).
     """
     pi_df = fetch_all_rows("player_innings", "*", eq_filters={"role": "batting"})
 
@@ -78,8 +78,8 @@ def get_batting_innings():
     if m_df.empty or pi_df.empty:
         return pd.DataFrame()
 
-    # Join player_style for bowling type
-    ps_df = fetch_all_rows("player_style", "player_id, pace_spin")
+    # Join player_style for bowling type / style
+    ps_df = fetch_all_rows("player_style", "player_id, pace_spin, bowl_style")
 
     pi_df = pi_df.merge(ps_df, on="player_id", how="left")
 
@@ -150,6 +150,17 @@ def add_season_column(df: pd.DataFrame, date_col: str = "day_1_start") -> pd.Dat
 SEGMENT_ORDER = ["1–10", "11–20", "21–30", "31–50", "51–75", "76+"]
 
 
+def sanitize_multiselect_state(key: str, valid_options: list) -> None:
+    """
+    Cascading filters mean an options list can shrink from one rerun to the
+    next. If a widget's stored selection contains values no longer present
+    in its options, Streamlit raises an error on render — so strip any
+    now-invalid values from session_state before the widget is created.
+    """
+    if key in st.session_state:
+        st.session_state[key] = [v for v in st.session_state[key] if v in valid_options]
+
+
 def segment_label(ball_index: int) -> str:
     if ball_index <= 10:
         return "1–10"
@@ -180,76 +191,100 @@ def batting_tab():
 
     # Sidebar filters
     st.sidebar.markdown("### Batting filters")
+    st.sidebar.caption("Filters are interdependent — each one narrows the options below it.")
 
-    # Grades: all present, sorted alphabetically. Default = no filter (nothing selected).
-    grades = sorted(batting_df["grade"].dropna().unique().tolist())
+    stage_df = batting_df.copy()
+
+    # Grade: all present, sorted alphabetically. Default = no filter (nothing selected).
+    grade_options = sorted(stage_df["grade"].dropna().unique().tolist())
+    sanitize_multiselect_state("filter_grade", grade_options)
     selected_grade = st.sidebar.multiselect(
-        "Grade", grades, default=[]
+        "Grade", grade_options, default=[], key="filter_grade"
     )
+    if selected_grade:
+        stage_df = stage_df[stage_df["grade"].isin(selected_grade)]
 
-    # Match types: all present, sorted alphabetically
-    match_types = sorted(batting_df["match_type"].dropna().unique().tolist())
+    # Match type: all present given grade selection, sorted alphabetically
+    match_type_options = sorted(stage_df["match_type"].dropna().unique().tolist())
+    sanitize_multiselect_state("filter_match_type", match_type_options)
     selected_match_type = st.sidebar.multiselect(
-        "Match type", match_types, default=match_types if match_types else []
+        "Match type", match_type_options,
+        default=match_type_options,
+        key="filter_match_type",
     )
+    if selected_match_type:
+        stage_df = stage_df[stage_df["match_type"].isin(selected_match_type)]
 
-    # Seasons: all present, sorted descending. Default = no filter (nothing selected).
-    all_seasons = (
-        batting_df["season"]
+    # Season: all present given grade/match type selection, sorted descending. Default = no filter.
+    season_options = (
+        stage_df["season"]
         .dropna()
         .drop_duplicates()
         .sort_values(ascending=False)
         .tolist()
     )
+    sanitize_multiselect_state("filter_season", season_options)
     selected_season = st.sidebar.multiselect(
-        "Season (July–June)",
-        options=all_seasons,
-        default=[],
+        "Season (July–June)", options=season_options, default=[], key="filter_season"
     )
+    if selected_season:
+        stage_df = stage_df[stage_df["season"].isin(selected_season)]
 
-    # Bowling type (pace_spin): all present, sorted alphabetically
-    bowling_types = sorted(batting_df["pace_spin"].dropna().unique().tolist())
+    # Bowling type (pace_spin): all present given filters so far
+    bowling_type_options = sorted(stage_df["pace_spin"].dropna().unique().tolist())
+    sanitize_multiselect_state("filter_bowling_type", bowling_type_options)
     selected_bowling_type = st.sidebar.multiselect(
-        "Bowling type (pace/spin)",
-        bowling_types,
-        default=bowling_types if bowling_types else [],
+        "Bowling type (pace/spin)", bowling_type_options,
+        default=bowling_type_options,
+        key="filter_bowling_type",
     )
+    if selected_bowling_type:
+        stage_df = stage_df[stage_df["pace_spin"].isin(selected_bowling_type)]
 
-    # Opponent team: all present, sorted alphabetically. Default = no filter (nothing selected).
-    opponent_teams = sorted(batting_df["opponent_team"].dropna().unique().tolist())
+    # Bowling style (bowl_style): separate filter, given filters so far
+    bowl_style_options = sorted(stage_df["bowl_style"].dropna().unique().tolist())
+    sanitize_multiselect_state("filter_bowl_style", bowl_style_options)
+    selected_bowl_style = st.sidebar.multiselect(
+        "Bowling style", bowl_style_options,
+        default=bowl_style_options,
+        key="filter_bowl_style",
+    )
+    if selected_bowl_style:
+        stage_df = stage_df[stage_df["bowl_style"].isin(selected_bowl_style)]
+
+    # Opponent team: all present given filters so far, sorted alphabetically. Default = no filter.
+    opponent_options = sorted(stage_df["opponent_team"].dropna().unique().tolist())
+    sanitize_multiselect_state("filter_opponent", opponent_options)
     selected_opponent = st.sidebar.multiselect(
-        "Opponent (bowling team)",
-        opponent_teams,
-        default=[],
+        "Opponent (bowling team)", opponent_options, default=[], key="filter_opponent"
     )
+    if selected_opponent:
+        stage_df = stage_df[stage_df["opponent_team"].isin(selected_opponent)]
 
-    # Batter filter (page-wide) — all batters sorted alphabetically
-    grouped_all = batting_df.groupby("player_id").agg(
+    # Batter filter (page-wide) — only batters with innings under the filters above
+    grouped_all = stage_df.groupby("player_id").agg(
         player_name=("player_name", "first"),
     ).reset_index()
 
     batter_options = sorted(grouped_all["player_name"].dropna().tolist())
+    if "filter_batter" in st.session_state and st.session_state["filter_batter"] not in (
+        ["All batters"] + batter_options
+    ):
+        st.session_state["filter_batter"] = "All batters"
     selected_batter_name = st.sidebar.selectbox(
         "Batter (applies to whole page)",
         options=["All batters"] + batter_options,
         index=0,
+        key="filter_batter",
     )
 
-    # Apply filters to innings-level data
-    filtered = batting_df.copy()
+    # `stage_df` already reflects every filter above (grade, match type, season,
+    # bowling type/style, opponent) — this is also the "population" for
+    # player-vs-population comparisons further down, before the batter filter narrows it.
+    population_df = stage_df
 
-    if selected_grade:
-        filtered = filtered[filtered["grade"].isin(selected_grade)]
-    if selected_match_type:
-        filtered = filtered[filtered["match_type"].isin(selected_match_type)]
-    if selected_season:
-        filtered = filtered[filtered["season"].isin(selected_season)]
-    if selected_bowling_type:
-        filtered = filtered[filtered["pace_spin"].isin(selected_bowling_type)]
-    if selected_opponent:
-        filtered = filtered[filtered["opponent_team"].isin(selected_opponent)]
-
-    # Batter filter
+    # Apply batter filter on top of the population to get the final working set
+    filtered = stage_df.copy()
     selected_batter_id = None
     if selected_batter_name != "All batters":
         batter_row = grouped_all[grouped_all["player_name"] == selected_batter_name].iloc[0]
@@ -391,22 +426,9 @@ def batting_tab():
         # Dismissal type distribution — player vs population
         st.subheader("Dismissal type distribution — player vs population")
 
-        # Helper: innings for population with same filters (no batter restriction)
-        def filtered_innings_for_population():
-            df = batting_df.copy()
-            if selected_grade:
-                df = df[df["grade"].isin(selected_grade)]
-            if selected_match_type:
-                df = df[df["match_type"].isin(selected_match_type)]
-            if selected_season:
-                df = df[df["season"].isin(selected_season)]
-            if selected_bowling_type:
-                df = df[df["pace_spin"].isin(selected_bowling_type)]
-            if selected_opponent:
-                df = df[df["opponent_team"].isin(selected_opponent)]
-            return df
-
-        pop_innings = filtered_innings_for_population()
+        # population_df already reflects grade/match type/season/bowling type &
+        # style/opponent filters (computed once, above, before the batter filter)
+        pop_innings = population_df
 
         # Exclude did not bat and not out
         excluded_types = {"Did Not Bat", "did not bat", "DNB", "Not Out", "not out"}
@@ -485,7 +507,7 @@ def batting_tab():
         # Boundary rate vs population (same filters except batter)
         st.subheader("Boundary rate vs population")
 
-        pop_boundary_df = filtered_innings_for_population()
+        pop_boundary_df = population_df
 
         pop_boundary = pop_boundary_df.groupby("player_id").agg(
             player_name=("player_name", "first"),
@@ -644,36 +666,53 @@ def batting_tab():
                     ascending=[False, True, True, True],
                 ).reset_index(drop=True)
 
-                h_top10 = h_sorted.head(10).reset_index(drop=True)
+                # Keep the current selection valid as filters change; default to
+                # the most recent highlight.
+                default_id = h_sorted.iloc[0]["highlight_id"]
+                if (
+                    "selected_highlight_id" not in st.session_state
+                    or st.session_state["selected_highlight_id"] not in h_sorted["highlight_id"].values
+                ):
+                    st.session_state["selected_highlight_id"] = default_id
 
-                st.caption("Click a row to load it in the player below.")
+                list_col, video_col = st.columns([3, 2])
 
-                event = st.dataframe(
-                    h_top10[
-                        ["batter", "bowler", "highlight_type", "metrics", "description"]
-                    ],
-                    use_container_width=True,
-                    height=300,  # forces a scrollbar within the top-10 list
-                    hide_index=True,
-                    on_select="rerun",
-                    selection_mode="single-row",
-                    key="highlights_table_select",
-                )
+                with list_col:
+                    st.caption(f"{len(h_sorted)} highlights — tap ▶ to play")
+                    # Fixed-height scrollable container holds the FULL list (not just
+                    # a top-10 slice), so it works the same on desktop and mobile.
+                    with st.container(height=480):
+                        for _, row in h_sorted.iterrows():
+                            hl_id = row["highlight_id"]
+                            row_text_col, row_btn_col = st.columns([5, 1])
+                            with row_text_col:
+                                date_str = (
+                                    row["day_1_start"].strftime("%d %b %Y")
+                                    if pd.notna(row.get("day_1_start"))
+                                    else ""
+                                )
+                                st.markdown(
+                                    f"**{row.get('batter', '')}** vs {row.get('bowler', '')} "
+                                    f"— {row.get('highlight_type', '')}  \n"
+                                    f"{row.get('description', '')}  \n"
+                                    f"<span style='color:gray;font-size:0.8em'>{date_str}</span>",
+                                    unsafe_allow_html=True,
+                                )
+                            with row_btn_col:
+                                if st.button("▶", key=f"play_{hl_id}"):
+                                    st.session_state["selected_highlight_id"] = hl_id
+                            st.divider()
 
-                selected_rows = (
-                    event.selection.rows
-                    if event and getattr(event, "selection", None)
-                    else []
-                )
-                selected_idx = selected_rows[0] if selected_rows else 0
-                selected_highlight = h_top10.iloc[selected_idx]
-
-                st.markdown(f"**{selected_highlight.get('description', '')}**")
-                url = selected_highlight.get("highlight_url")
-                if url:
-                    st.video(url, autoplay=True)
-                else:
-                    st.info("No video URL available for this highlight.")
+                with video_col:
+                    selected_highlight = h_sorted[
+                        h_sorted["highlight_id"] == st.session_state["selected_highlight_id"]
+                    ].iloc[0]
+                    st.markdown(f"**{selected_highlight.get('description', '')}**")
+                    url = selected_highlight.get("highlight_url")
+                    if url:
+                        st.video(url, autoplay=True)
+                    else:
+                        st.info("No video URL available for this highlight.")
 
 
 # ---------- Bowling tab (placeholder) ----------
