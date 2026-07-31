@@ -25,33 +25,65 @@ supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 # ---------- Helper functions ----------
 
 def fetch_all_rows(table_name: str, select_str: str, eq_filters: dict | None = None,
-                    order_col: str | None = None, page_size: int = 1000) -> pd.DataFrame:
+                    order_col: str | None = None, page_size: int = 1000,
+                    id_col: str | None = None) -> pd.DataFrame:
     """
     Fetch ALL rows from a Supabase table, paging past PostgREST's default
     1000-row-per-request limit. Without this, .execute() silently truncates
     large tables and any "distinct values" derived from the result (e.g.
     grade/season/opponent filter options) will only reflect whatever slice
     of rows happened to come back.
+
+    Two pagination strategies:
+    - Offset pagination (default): uses .range(start, start+page_size-1).
+      Fine for small/medium tables.
+    - Keyset pagination (pass id_col, e.g. a primary key): uses
+      "WHERE id_col > last_seen_id ORDER BY id_col LIMIT page_size" instead
+      of OFFSET. Required for large tables (e.g. deliveries) — with OFFSET,
+      Postgres has to scan and discard every prior row on each page, which
+      gets slower as the offset grows and can hit a statement timeout
+      partway through a big table. Keyset pagination stays fast regardless
+      of how deep into the table it gets.
     """
     all_rows = []
-    start = 0
 
-    while True:
-        query = supabase.table(table_name).select(select_str)
-        if eq_filters:
-            for col, val in eq_filters.items():
-                query = query.eq(col, val)
-        if order_col:
-            query = query.order(order_col)
-        query = query.range(start, start + page_size - 1)
+    if id_col:
+        last_id = None
+        while True:
+            query = supabase.table(table_name).select(select_str)
+            if eq_filters:
+                for col, val in eq_filters.items():
+                    query = query.eq(col, val)
+            query = query.order(id_col)
+            if last_id is not None:
+                query = query.gt(id_col, last_id)
+            query = query.limit(page_size)
 
-        resp = query.execute()
-        rows = resp.data or []
-        all_rows.extend(rows)
+            resp = query.execute()
+            rows = resp.data or []
+            all_rows.extend(rows)
 
-        if len(rows) < page_size:
-            break
-        start += page_size
+            if len(rows) < page_size:
+                break
+            last_id = rows[-1][id_col]
+    else:
+        start = 0
+        while True:
+            query = supabase.table(table_name).select(select_str)
+            if eq_filters:
+                for col, val in eq_filters.items():
+                    query = query.eq(col, val)
+            if order_col:
+                query = query.order(order_col)
+            query = query.range(start, start + page_size - 1)
+
+            resp = query.execute()
+            rows = resp.data or []
+            all_rows.extend(rows)
+
+            if len(rows) < page_size:
+                break
+            start += page_size
 
     return pd.DataFrame(all_rows)
 
@@ -133,12 +165,16 @@ def get_highlights():
 @st.cache_data(ttl=300)
 def get_bowling_deliveries():
     """
-    Deliveries at bowler grain — just enough columns to count legal balls
-    bowled per bowler and join to matches for the grade filter.
+    Legal deliveries (wides = 0) at bowler grain — just enough columns to
+    count balls bowled per bowler and join to matches for the grade filter.
+    Uses keyset pagination (id_col="ball_id") since `deliveries` is large
+    enough that offset-based pagination times out.
     """
     return fetch_all_rows(
         "deliveries",
-        "bowler_id, bowler, match_id, wides",
+        "ball_id, bowler_id, bowler, match_id",
+        eq_filters={"wides": 0},
+        id_col="ball_id",
     )
 
 
@@ -179,6 +215,28 @@ def sanitize_multiselect_state(key: str, valid_options: list) -> None:
         st.session_state[key] = [v for v in st.session_state[key] if v in valid_options]
 
 
+def cascading_multiselect(container, label: str, options: list, key: str,
+                           default_options: list | None = None):
+    """
+    Multiselect for a cascading filter chain. Sanitizes stored state against
+    the current options list, then creates the widget.
+
+    Important: `default` is only passed the very first time the widget is
+    created (i.e. before session_state[key] exists). Passing `default` on a
+    later run, after sanitize_multiselect_state has already written to
+    session_state[key], makes Streamlit think the value was set two
+    different ways in the same run and triggers a
+    "created with a default value but also had its value set via the
+    Session State API" warning — so we omit `default` on every run after
+    the first.
+    """
+    sanitize_multiselect_state(key, options)
+    kwargs = {}
+    if key not in st.session_state:
+        kwargs["default"] = default_options if default_options is not None else []
+    return container.multiselect(label, options, key=key, **kwargs)
+
+
 def segment_label(ball_index: int) -> str:
     if ball_index <= 10:
         return "1–10"
@@ -215,20 +273,17 @@ def batting_tab():
 
     # Grade: all present, sorted alphabetically. Default = no filter (nothing selected).
     grade_options = sorted(stage_df["grade"].dropna().unique().tolist())
-    sanitize_multiselect_state("filter_grade", grade_options)
-    selected_grade = st.sidebar.multiselect(
-        "Grade", grade_options, default=[], key="filter_grade"
+    selected_grade = cascading_multiselect(
+        st.sidebar, "Grade", grade_options, "filter_grade"
     )
     if selected_grade:
         stage_df = stage_df[stage_df["grade"].isin(selected_grade)]
 
     # Match type: all present given grade selection, sorted alphabetically
     match_type_options = sorted(stage_df["match_type"].dropna().unique().tolist())
-    sanitize_multiselect_state("filter_match_type", match_type_options)
-    selected_match_type = st.sidebar.multiselect(
-        "Match type", match_type_options,
-        default=match_type_options,
-        key="filter_match_type",
+    selected_match_type = cascading_multiselect(
+        st.sidebar, "Match type", match_type_options, "filter_match_type",
+        default_options=match_type_options,
     )
     if selected_match_type:
         stage_df = stage_df[stage_df["match_type"].isin(selected_match_type)]
@@ -241,40 +296,34 @@ def batting_tab():
         .sort_values(ascending=False)
         .tolist()
     )
-    sanitize_multiselect_state("filter_season", season_options)
-    selected_season = st.sidebar.multiselect(
-        "Season (July–June)", options=season_options, default=[], key="filter_season"
+    selected_season = cascading_multiselect(
+        st.sidebar, "Season (July–June)", season_options, "filter_season"
     )
     if selected_season:
         stage_df = stage_df[stage_df["season"].isin(selected_season)]
 
     # Bowling type (pace_spin): all present given filters so far
     bowling_type_options = sorted(stage_df["pace_spin"].dropna().unique().tolist())
-    sanitize_multiselect_state("filter_bowling_type", bowling_type_options)
-    selected_bowling_type = st.sidebar.multiselect(
-        "Bowling type (pace/spin)", bowling_type_options,
-        default=bowling_type_options,
-        key="filter_bowling_type",
+    selected_bowling_type = cascading_multiselect(
+        st.sidebar, "Bowling type (pace/spin)", bowling_type_options, "filter_bowling_type",
+        default_options=bowling_type_options,
     )
     if selected_bowling_type:
         stage_df = stage_df[stage_df["pace_spin"].isin(selected_bowling_type)]
 
     # Bowling style (bowl_style): separate filter, given filters so far
     bowl_style_options = sorted(stage_df["bowl_style"].dropna().unique().tolist())
-    sanitize_multiselect_state("filter_bowl_style", bowl_style_options)
-    selected_bowl_style = st.sidebar.multiselect(
-        "Bowling style", bowl_style_options,
-        default=bowl_style_options,
-        key="filter_bowl_style",
+    selected_bowl_style = cascading_multiselect(
+        st.sidebar, "Bowling style", bowl_style_options, "filter_bowl_style",
+        default_options=bowl_style_options,
     )
     if selected_bowl_style:
         stage_df = stage_df[stage_df["bowl_style"].isin(selected_bowl_style)]
 
     # Opponent team: all present given filters so far, sorted alphabetically. Default = no filter.
     opponent_options = sorted(stage_df["opponent_team"].dropna().unique().tolist())
-    sanitize_multiselect_state("filter_opponent", opponent_options)
-    selected_opponent = st.sidebar.multiselect(
-        "Opponent (bowling team)", opponent_options, default=[], key="filter_opponent"
+    selected_opponent = cascading_multiselect(
+        st.sidebar, "Opponent (bowling team)", opponent_options, "filter_opponent"
     )
     if selected_opponent:
         stage_df = stage_df[stage_df["opponent_team"].isin(selected_opponent)]
@@ -354,7 +403,7 @@ def batting_tab():
         display_df[
             ["player_name", "innings", "total_runs", "average", "strike_rate", "BPD", "fours", "sixes"]
         ].sort_values("player_name"),
-        use_container_width=True,
+        width='stretch',
     )
 
     # Batter detail metrics (if specific batter selected)
@@ -427,7 +476,7 @@ def batting_tab():
                 lambda x: f"{x:.0f}" if pd.notna(x) else "–"
             )
 
-            st.dataframe(seg_display, use_container_width=True)
+            st.dataframe(seg_display, width='stretch')
 
             fig_seg = px.bar(
                 seg,
@@ -436,7 +485,7 @@ def batting_tab():
                 category_orders={"segment": SEGMENT_ORDER},
                 title=f"Strike rate by ball segment for {selected_row['player_name']}",
             )
-            st.plotly_chart(fig_seg, use_container_width=True)
+            st.plotly_chart(fig_seg, width='stretch')
             
             
             
@@ -508,9 +557,9 @@ def batting_tab():
                 barmode="group",
                 title="Dismissal type % — player vs population",
             )
-            st.plotly_chart(fig_comp, use_container_width=True)
+            st.plotly_chart(fig_comp, width='stretch')
 
-            st.dataframe(comp_df, use_container_width=True)
+            st.dataframe(comp_df, width='stretch')
 
         # Distribution of innings scores
         st.subheader("Distribution of innings scores (runs)")
@@ -520,7 +569,7 @@ def batting_tab():
             nbins=20,
             title="Distribution of individual innings runs",
         )
-        st.plotly_chart(fig_runs, use_container_width=True)
+        st.plotly_chart(fig_runs, width='stretch')
 
         # Boundary rate vs population (same filters except batter)
         st.subheader("Boundary rate vs population")
@@ -624,7 +673,7 @@ def batting_tab():
                 ["bat_position", "innings", "runs", "average", "strike_rate",
                  "fours_per_100_balls", "sixes_per_100_balls", "dismissals", "fours", "sixes"]
             ].sort_values("bat_position"),
-            use_container_width=True,
+            width='stretch',
         )
 
         # Highlights viewer
@@ -777,9 +826,8 @@ def bowler_style_tab():
     if selected_grade:
         d_filtered = d_filtered[d_filtered["grade"].isin(selected_grade)]
 
-    # Legal deliveries only (same convention as the batting tab's ball segments)
-    d_filtered["wides"] = d_filtered["wides"].fillna(0)
-    d_filtered = d_filtered[d_filtered["wides"] == 0]
+    # Legal deliveries only — already filtered server-side (wides = 0) in
+    # get_bowling_deliveries(), just drop any rows with no bowler recorded.
     d_filtered = d_filtered[d_filtered["bowler_id"].notna()]
 
     if d_filtered.empty:
