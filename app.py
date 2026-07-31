@@ -802,6 +802,10 @@ def bowler_style_tab():
         return
 
     matches_df = get_matches()
+    # get_matches() returns day_1_start as a raw string from Supabase — convert
+    # to real datetimes here so we can sort/format dates below.
+    matches_df["day_1_start"] = pd.to_datetime(matches_df["day_1_start"])
+
     deliveries_df = deliveries_df.merge(
         matches_df[["match_id", "grade"]], on="match_id", how="left"
     )
@@ -877,88 +881,94 @@ def bowler_style_tab():
             return full_options.index(current_value)
         return 0
 
-    with st.container(height=480):
-        for _, row in bowler_summary.iterrows():
-            bid = row["bowler_id"]
-            c_name, c_ps, c_hand, c_style, c_save, c_select = st.columns([2, 1, 1, 1, 1, 1])
-
-            with c_name:
-                st.markdown(f"**{row['bowler_name']}**  \n{int(row['balls'])} balls")
-            with c_ps:
-                ps_val = st.selectbox(
-                    "Pace/Spin", ["–"] + pace_spin_opts,
-                    index=_dropdown_index(pace_spin_opts, row.get("pace_spin")),
-                    key=f"ps_{bid}", label_visibility="collapsed",
-                )
-            with c_hand:
-                hand_val = st.selectbox(
-                    "Hand", ["–"] + bowl_hand_opts,
-                    index=_dropdown_index(bowl_hand_opts, row.get("bowl_hand")),
-                    key=f"hand_{bid}", label_visibility="collapsed",
-                )
-            with c_style:
-                style_val = st.selectbox(
-                    "Style", ["–"] + bowl_style_opts,
-                    index=_dropdown_index(bowl_style_opts, row.get("bowl_style")),
-                    key=f"style_{bid}", label_visibility="collapsed",
-                )
-            with c_save:
-                if st.button("💾 Save", key=f"save_{bid}"):
-                    payload = {
-                        "player_id": str(bid),
-                        "pace_spin": None if ps_val == "–" else ps_val,
-                        "bowl_hand": None if hand_val == "–" else hand_val,
-                        "bowl_style": None if style_val == "–" else style_val,
-                    }
-                    try:
-                        supabase.table("player_style").upsert(
-                            payload, on_conflict="player_id"
-                        ).execute()
-                        st.success(f"Saved {row['bowler_name']}")
-                        get_player_style.clear()
-                    except Exception as e:
-                        st.error(f"Save failed: {e}")
-            with c_select:
-                if st.button("Highlights", key=f"sel_{bid}"):
-                    st.session_state["selected_bowler_id"] = bid
-
-            st.divider()
-
-    # ---- Highlights panel for the selected bowler ----
-    selected_row = bowler_summary[
-        bowler_summary["bowler_id"] == st.session_state["selected_bowler_id"]
-    ].iloc[0]
-    st.subheader(f"Highlights — {selected_row['bowler_name']}")
-
-    highlights_df = get_highlights()
-    bowler_highlights = highlights_df[
-        highlights_df["bowler_id"] == str(selected_row["bowler_id"])
-    ].copy()
-
-    if bowler_highlights.empty:
-        st.info("No highlights available for this bowler.")
-        return
-
-    bowler_highlights = bowler_highlights.merge(
-        matches_df[["match_id", "day_1_start"]], on="match_id", how="left"
-    )
-    bh_sorted = bowler_highlights.sort_values(
-        ["day_1_start", "innings_number", "over", "ball_number"],
-        ascending=[False, True, True, True],
-    ).reset_index(drop=True)
-
-    if (
-        "selected_bowler_highlight_id" not in st.session_state
-        or st.session_state["selected_bowler_highlight_id"] not in bh_sorted["highlight_id"].values
-    ):
-        st.session_state["selected_bowler_highlight_id"] = bh_sorted.iloc[0]["highlight_id"]
-
-    # Equal columns so the video takes up roughly half the screen width
-    list_col, video_col = st.columns(2)
+    # Bowler list (left) and highlights + video (right), side by side, so
+    # picking a bowler's highlights never requires scrolling down the page.
+    PANEL_HEIGHT = 560
+    list_col, highlight_col = st.columns([3, 2])
 
     with list_col:
+        with st.container(height=PANEL_HEIGHT):
+            for _, row in bowler_summary.iterrows():
+                bid = row["bowler_id"]
+                st.markdown(f"**{row['bowler_name']}** — {int(row['balls'])} balls")
+
+                c_ps, c_hand, c_style, c_save, c_select = st.columns([1, 1, 1, 1, 1])
+                with c_ps:
+                    ps_val = st.selectbox(
+                        "Pace/Spin", ["–"] + pace_spin_opts,
+                        index=_dropdown_index(pace_spin_opts, row.get("pace_spin")),
+                        key=f"ps_{bid}", label_visibility="collapsed",
+                    )
+                with c_hand:
+                    hand_val = st.selectbox(
+                        "Hand", ["–"] + bowl_hand_opts,
+                        index=_dropdown_index(bowl_hand_opts, row.get("bowl_hand")),
+                        key=f"hand_{bid}", label_visibility="collapsed",
+                    )
+                with c_style:
+                    style_val = st.selectbox(
+                        "Style", ["–"] + bowl_style_opts,
+                        index=_dropdown_index(bowl_style_opts, row.get("bowl_style")),
+                        key=f"style_{bid}", label_visibility="collapsed",
+                    )
+                with c_save:
+                    if st.button("💾", key=f"save_{bid}", help="Save style"):
+                        payload = {
+                            "player_id": str(bid),
+                            "pace_spin": None if ps_val == "–" else ps_val,
+                            "bowl_hand": None if hand_val == "–" else hand_val,
+                            "bowl_style": None if style_val == "–" else style_val,
+                        }
+                        try:
+                            supabase.table("player_style").upsert(
+                                payload, on_conflict="player_id"
+                            ).execute()
+                            st.success(f"Saved {row['bowler_name']}")
+                            get_player_style.clear()
+                        except Exception as e:
+                            st.error(f"Save failed: {e}")
+                with c_select:
+                    if st.button("▶", key=f"sel_{bid}", help="Show highlights"):
+                        st.session_state["selected_bowler_id"] = bid
+
+                st.divider()
+
+    # ---- Highlights panel for the selected bowler (next to the list, not below it) ----
+    with highlight_col:
+        selected_row = bowler_summary[
+            bowler_summary["bowler_id"] == st.session_state["selected_bowler_id"]
+        ].iloc[0]
+        st.subheader(f"Highlights — {selected_row['bowler_name']}")
+
+        highlights_df = get_highlights()
+        bowler_highlights = highlights_df[
+            highlights_df["bowler_id"] == str(selected_row["bowler_id"])
+        ].copy()
+
+        if bowler_highlights.empty:
+            st.info("No highlights available for this bowler.")
+            return
+
+        bowler_highlights = bowler_highlights.merge(
+            matches_df[["match_id", "day_1_start"]], on="match_id", how="left"
+        )
+        bh_sorted = bowler_highlights.sort_values(
+            ["day_1_start", "innings_number", "over", "ball_number"],
+            ascending=[False, True, True, True],
+        ).reset_index(drop=True)
+
+        if (
+            "selected_bowler_highlight_id" not in st.session_state
+            or st.session_state["selected_bowler_highlight_id"] not in bh_sorted["highlight_id"].values
+        ):
+            st.session_state["selected_bowler_highlight_id"] = bh_sorted.iloc[0]["highlight_id"]
+
         st.caption(f"{len(bh_sorted)} highlights — tap ▶ to play")
-        with st.container(height=400):
+
+        # Mini list (top) + video (bottom), stacked within this same column so
+        # both are visible next to the bowler list without scrolling the page.
+        list_height = 200
+        with st.container(height=list_height):
             for _, hrow in bh_sorted.iterrows():
                 hid = hrow["highlight_id"]
                 txt_col, btn_col = st.columns([5, 1])
@@ -979,7 +989,6 @@ def bowler_style_tab():
                         st.session_state["selected_bowler_highlight_id"] = hid
                 st.divider()
 
-    with video_col:
         sel_h = bh_sorted[
             bh_sorted["highlight_id"] == st.session_state["selected_bowler_highlight_id"]
         ].iloc[0]
