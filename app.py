@@ -126,10 +126,10 @@ def batting_tab():
     # Sidebar filters
     st.sidebar.markdown("### Batting filters")
 
-    # Grades: all present, sorted alphabetically
+    # Grades: all present, sorted alphabetically. Default = no filter (nothing selected).
     grades = sorted(batting_df["grade"].dropna().unique().tolist())
     selected_grade = st.sidebar.multiselect(
-        "Grade", grades, default=grades if grades else []
+        "Grade", grades, default=[]
     )
 
     # Match types: all present, sorted alphabetically
@@ -138,7 +138,7 @@ def batting_tab():
         "Match type", match_types, default=match_types if match_types else []
     )
 
-    # Seasons: all present, sorted descending; default = last 5
+    # Seasons: all present, sorted descending. Default = no filter (nothing selected).
     all_seasons = (
         batting_df["season"]
         .dropna()
@@ -146,11 +146,10 @@ def batting_tab():
         .sort_values(ascending=False)
         .tolist()
     )
-    last_five_seasons = all_seasons[:5]
     selected_season = st.sidebar.multiselect(
         "Season (July–June)",
         options=all_seasons,
-        default=last_five_seasons,
+        default=[],
     )
 
     # Bowling type (pace_spin): all present, sorted alphabetically
@@ -161,12 +160,12 @@ def batting_tab():
         default=bowling_types if bowling_types else [],
     )
 
-    # Opponent team: all present, sorted alphabetically
+    # Opponent team: all present, sorted alphabetically. Default = no filter (nothing selected).
     opponent_teams = sorted(batting_df["opponent_team"].dropna().unique().tolist())
     selected_opponent = st.sidebar.multiselect(
         "Opponent (bowling team)",
         opponent_teams,
-        default=opponent_teams if opponent_teams else [],
+        default=[],
     )
 
     # Batter filter (page-wide) — all batters sorted alphabetically
@@ -423,57 +422,6 @@ def batting_tab():
         # Boundary rate vs population (same filters except batter)
         st.subheader("Boundary rate vs population")
 
-        pop_boundary_df = filtered_innings_for_population()
-
-        pop_boundary = pop_boundary_df.groupby("player_id").agg(
-            player_name=("player_name", "first"),
-            runs=("runs", "sum"),
-            balls=("balls_faced", "sum"),
-            fours=("fours", "sum"),
-            sixes=("sixes", "sum"),
-        ).reset_index()
-
-        pop_boundary["fours_per_100_balls"] = pop_boundary.apply(
-            lambda r: 100 * r["fours"] / r["balls"] if r["balls"] > 0 else None,
-            axis=1,
-        )
-        pop_boundary["sixes_per_100_balls"] = pop_boundary.apply(
-            lambda r: 100 * r["sixes"] / r["balls"] if r["balls"] > 0 else None,
-            axis=1,
-        )
-
-        pcol1, pcol2 = st.columns(2)
-        pcol1.metric(
-            "Population avg fours/100 balls",
-            f"{pop_boundary['fours_per_100_balls'].mean():.2f}"
-            if pop_boundary["fours_per_100_balls"].notna().any()
-            else "–",
-        )
-        pcol2.metric(
-            "Population avg sixes/100 balls",
-            f"{pop_boundary['sixes_per_100_balls'].mean():.2f}"
-            if pop_boundary["sixes_per_100_balls"].notna().any()
-            else "–",
-        )
-
-        if selected_batter_id is not None:
-            batter_boundary_row = pop_boundary[pop_boundary["player_id"] == selected_batter_id].iloc[0]
-
-            bcol1, bcol2 = st.columns(2)
-            bcol1.metric(
-                "Fours per 100 balls (batter)",
-                f"{batter_boundary_row['fours_per_100_balls']:.2f}"
-                if pd.notna(batter_boundary_row["fours_per_100_balls"])
-                else "–",
-            )
-            bcol2.metric(
-                "Sixes per 100 balls (batter)",
-                f"{batter_boundary_row['sixes_per_100_balls']:.2f}"
-                if pd.notna(batter_boundary_row["sixes_per_100_balls"])
-                else "–",
-            )
-
-        # Population: same innings filters, no batter restriction
         pop_boundary_df = filtered_innings_for_population()
 
         pop_boundary = pop_boundary_df.groupby("player_id").agg(
