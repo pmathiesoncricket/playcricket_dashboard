@@ -121,6 +121,15 @@ def get_deliveries_for_batter(batter_id: str):
     return pd.DataFrame(all_rows)
 
 
+@st.cache_data(ttl=300)
+def get_highlights():
+    """
+    Highlight clips (fours, sixes, dismissals, etc.) with video URLs.
+    Paginated fetch to avoid PostgREST's default 1000-row cap.
+    """
+    return fetch_all_rows("highlights", "*")
+
+
 def add_season_column(df: pd.DataFrame, date_col: str = "day_1_start") -> pd.DataFrame:
     """
     Add season column with July–June seasons, formatted as 'YYYY/YYYY'.
@@ -136,6 +145,9 @@ def add_season_column(df: pd.DataFrame, date_col: str = "day_1_start") -> pd.Dat
     season_end_year = season_start_year + 1
     df["season"] = season_start_year.astype(str) + "/" + season_end_year.astype(str)
     return df
+
+
+SEGMENT_ORDER = ["1–10", "11–20", "21–30", "31–50", "51–75", "76+"]
 
 
 def segment_label(ball_index: int) -> str:
@@ -328,9 +340,13 @@ def batting_tab():
 
             deliveries_df = deliveries_df[deliveries_df["ball_index"].notna()]
             deliveries_df["ball_index"] = deliveries_df["ball_index"].astype(int)
-            deliveries_df["segment"] = deliveries_df["ball_index"].map(segment_label)
+            deliveries_df["segment"] = pd.Categorical(
+                deliveries_df["ball_index"].map(segment_label),
+                categories=SEGMENT_ORDER,
+                ordered=True,
+            )
 
-            seg = deliveries_df.groupby("segment").agg(
+            seg = deliveries_df.groupby("segment", observed=True).agg(
                 balls=("ball_index", "count"),
                 runs=("batter_runs", "sum"),
                 dismissals=("dismissal_type", lambda x: x.notna().sum()),
@@ -347,6 +363,9 @@ def batting_tab():
                 axis=1,
             )
 
+            seg["segment"] = pd.Categorical(seg["segment"], categories=SEGMENT_ORDER, ordered=True)
+            seg = seg.sort_values("segment").reset_index(drop=True)
+
             seg_display = seg.copy()
             seg_display["strike_rate"] = seg_display["strike_rate"].apply(
                 lambda x: f"{x:.0f}" if pd.notna(x) else "–"
@@ -355,12 +374,13 @@ def batting_tab():
                 lambda x: f"{x:.0f}" if pd.notna(x) else "–"
             )
 
-            st.dataframe(seg_display.sort_values("segment"), use_container_width=True)
+            st.dataframe(seg_display, use_container_width=True)
 
             fig_seg = px.bar(
                 seg,
                 x="segment",
                 y="strike_rate",
+                category_orders={"segment": SEGMENT_ORDER},
                 title=f"Strike rate by ball segment for {selected_row['player_name']}",
             )
             st.plotly_chart(fig_seg, use_container_width=True)
@@ -373,7 +393,7 @@ def batting_tab():
 
         # Helper: innings for population with same filters (no batter restriction)
         def filtered_innings_for_population():
-            df = innings_df.copy()
+            df = batting_df.copy()
             if selected_grade:
                 df = df[df["grade"].isin(selected_grade)]
             if selected_match_type:
@@ -596,7 +616,7 @@ def batting_tab():
                 if selected_h_type == "Sixes":
                     return "SIX" in desc or "SIX" in h_type
                 if selected_h_type == "Dismissals":
-                    return (row.get("dismissal_type") is not None) or ("OUT" in desc) or ("WICKET" in desc)
+                    return ("OUT" in desc) or ("WICKET" in desc) or ("OUT" in h_type) or ("WICKET" in h_type)
                 return True
 
             h_filtered = h_filtered[h_filtered.apply(highlight_type_filter, axis=1)]
