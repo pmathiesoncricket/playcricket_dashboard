@@ -24,13 +24,46 @@ supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 # ---------- Helper functions ----------
 
+def fetch_all_rows(table_name: str, select_str: str, eq_filters: dict | None = None,
+                    order_col: str | None = None, page_size: int = 1000) -> pd.DataFrame:
+    """
+    Fetch ALL rows from a Supabase table, paging past PostgREST's default
+    1000-row-per-request limit. Without this, .execute() silently truncates
+    large tables and any "distinct values" derived from the result (e.g.
+    grade/season/opponent filter options) will only reflect whatever slice
+    of rows happened to come back.
+    """
+    all_rows = []
+    start = 0
+
+    while True:
+        query = supabase.table(table_name).select(select_str)
+        if eq_filters:
+            for col, val in eq_filters.items():
+                query = query.eq(col, val)
+        if order_col:
+            query = query.order(order_col)
+        query = query.range(start, start + page_size - 1)
+
+        resp = query.execute()
+        rows = resp.data or []
+        all_rows.extend(rows)
+
+        if len(rows) < page_size:
+            break
+        start += page_size
+
+    return pd.DataFrame(all_rows)
+
+
 @st.cache_data(ttl=300)
 def get_matches():
-    resp = supabase.table("matches").select(
+    return fetch_all_rows(
+        "matches",
         "match_id, grade, match_type, day_1_start, "
-        "home_team_id, home_team, away_team_id, away_team"
-    ).execute()
-    return pd.DataFrame(resp.data)
+        "home_team_id, home_team, away_team_id, away_team",
+        order_col="match_id",
+    )
 
 
 @st.cache_data(ttl=300)
@@ -39,16 +72,14 @@ def get_batting_innings():
     player_innings for role='batting', joined to matches for grade/match_type/date/opponent,
     and joined to player_style for bowling type (pace_spin).
     """
-    pi_resp = supabase.table("player_innings").select("*").eq("role", "batting").execute()
-    pi_df = pd.DataFrame(pi_resp.data)
+    pi_df = fetch_all_rows("player_innings", "*", eq_filters={"role": "batting"})
 
     m_df = get_matches()
     if m_df.empty or pi_df.empty:
         return pd.DataFrame()
 
     # Join player_style for bowling type
-    ps_resp = supabase.table("player_style").select("player_id, pace_spin").execute()
-    ps_df = pd.DataFrame(ps_resp.data)
+    ps_df = fetch_all_rows("player_style", "player_id, pace_spin")
 
     pi_df = pi_df.merge(ps_df, on="player_id", how="left")
 
@@ -66,16 +97,28 @@ def get_batting_innings():
 
 @st.cache_data(ttl=300)
 def get_deliveries_for_batter(batter_id: str):
-    resp = (
-        supabase.table("deliveries")
-        .select("*")
-        .eq("batter_id", batter_id)
-        .order("innings_id", desc=False)
-        .order("over", desc=False)
-        .order("ball_number", desc=False)
-        .execute()
-    )
-    return pd.DataFrame(resp.data)
+    all_rows = []
+    start = 0
+    page_size = 1000
+
+    while True:
+        resp = (
+            supabase.table("deliveries")
+            .select("*")
+            .eq("batter_id", batter_id)
+            .order("innings_id", desc=False)
+            .order("over", desc=False)
+            .order("ball_number", desc=False)
+            .range(start, start + page_size - 1)
+            .execute()
+        )
+        rows = resp.data or []
+        all_rows.extend(rows)
+        if len(rows) < page_size:
+            break
+        start += page_size
+
+    return pd.DataFrame(all_rows)
 
 
 def add_season_column(df: pd.DataFrame, date_col: str = "day_1_start") -> pd.DataFrame:
