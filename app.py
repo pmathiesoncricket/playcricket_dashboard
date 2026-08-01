@@ -1,25 +1,17 @@
-import os
 import streamlit as st
 import pandas as pd
 import plotly.express as px
-from supabase import create_client, Client
-from dotenv import load_dotenv  # make sure python-dotenv is installed
+from sqlalchemy import text
 
 
 # ---------- Setup ----------
 
-load_dotenv()  # load .env from project root
-
 st.set_page_config(page_title="PlayCricket Dashboard", layout="wide")
 
-SUPABASE_URL = os.getenv("SUPABASE_URL")
-SUPABASE_KEY = os.getenv("SUPABASE_KEY")
-
-if not SUPABASE_URL or not SUPABASE_KEY:
-    st.error("Missing SUPABASE_URL or SUPABASE_KEY environment variables.")
-    st.stop()
-
-supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+# Reads connection details from .streamlit/secrets.toml under
+# [connections.postgresql] — see the accompanying setup notes for the
+# exact keys required (host, port, database, username, password).
+conn = st.connection("postgresql", type="sql")
 
 
 # ---------- Helper functions ----------
@@ -28,64 +20,71 @@ def fetch_all_rows(table_name: str, select_str: str, eq_filters: dict | None = N
                     order_col: str | None = None, page_size: int = 1000,
                     id_col: str | None = None) -> pd.DataFrame:
     """
-    Fetch ALL rows from a Supabase table, paging past PostgREST's default
-    1000-row-per-request limit. Without this, .execute() silently truncates
-    large tables and any "distinct values" derived from the result (e.g.
-    grade/season/opponent filter options) will only reflect whatever slice
-    of rows happened to come back.
+    Fetch ALL rows from a Postgres table, paging manually via raw SQL.
 
-    Two pagination strategies:
-    - Offset pagination (default): uses .range(start, start+page_size-1).
-      Fine for small/medium tables.
-    - Keyset pagination (pass id_col, e.g. a primary key): uses
-      "WHERE id_col > last_seen_id ORDER BY id_col LIMIT page_size" instead
-      of OFFSET. Required for large tables (e.g. deliveries) — with OFFSET,
-      Postgres has to scan and discard every prior row on each page, which
-      gets slower as the offset grows and can hit a statement timeout
-      partway through a big table. Keyset pagination stays fast regardless
-      of how deep into the table it gets.
+    Two pagination strategies, same as the original Supabase version:
+    - Offset pagination (default): LIMIT/OFFSET. Fine for small/medium tables.
+    - Keyset pagination (pass id_col, e.g. a primary key): "WHERE id_col >
+      last_seen_id ORDER BY id_col LIMIT page_size" instead of OFFSET.
+      Required for large tables (e.g. deliveries) — OFFSET has to scan and
+      discard every prior row on each page, which gets slower as the offset
+      grows. Keyset pagination stays fast regardless of table depth.
+
+    ttl=0 on conn.query() disables st.connection's own query-level cache
+    here, since the outer functions below already apply @st.cache_data at
+    the whole-DataFrame level — matching the original caching behavior.
     """
-    all_rows = []
+    pages = []
 
     if id_col:
         last_id = None
         while True:
-            query = supabase.table(table_name).select(select_str)
+            where_clauses = []
+            params = {}
             if eq_filters:
-                for col, val in eq_filters.items():
-                    query = query.eq(col, val)
-            query = query.order(id_col)
+                for i, (col, val) in enumerate(eq_filters.items()):
+                    where_clauses.append(f"{col} = :eq_{i}")
+                    params[f"eq_{i}"] = val
             if last_id is not None:
-                query = query.gt(id_col, last_id)
-            query = query.limit(page_size)
+                where_clauses.append(f"{id_col} > :last_id")
+                params["last_id"] = last_id
+            where_sql = f"WHERE {' AND '.join(where_clauses)}" if where_clauses else ""
+            params["page_size"] = page_size
+            sql = f"SELECT {select_str} FROM {table_name} {where_sql} ORDER BY {id_col} LIMIT :page_size"
 
-            resp = query.execute()
-            rows = resp.data or []
-            all_rows.extend(rows)
-
-            if len(rows) < page_size:
+            df_page = conn.query(sql, params=params, ttl=0)
+            if df_page.empty:
                 break
-            last_id = rows[-1][id_col]
+            pages.append(df_page)
+            if len(df_page) < page_size:
+                break
+            last_id = df_page.iloc[-1][id_col]
     else:
         start = 0
         while True:
-            query = supabase.table(table_name).select(select_str)
+            where_clauses = []
+            params = {}
             if eq_filters:
-                for col, val in eq_filters.items():
-                    query = query.eq(col, val)
-            if order_col:
-                query = query.order(order_col)
-            query = query.range(start, start + page_size - 1)
+                for i, (col, val) in enumerate(eq_filters.items()):
+                    where_clauses.append(f"{col} = :eq_{i}")
+                    params[f"eq_{i}"] = val
+            where_sql = f"WHERE {' AND '.join(where_clauses)}" if where_clauses else ""
+            order_sql = f"ORDER BY {order_col}" if order_col else ""
+            params["limit"] = page_size
+            params["offset"] = start
+            sql = f"SELECT {select_str} FROM {table_name} {where_sql} {order_sql} LIMIT :limit OFFSET :offset"
 
-            resp = query.execute()
-            rows = resp.data or []
-            all_rows.extend(rows)
-
-            if len(rows) < page_size:
+            df_page = conn.query(sql, params=params, ttl=0)
+            if df_page.empty:
+                break
+            pages.append(df_page)
+            if len(df_page) < page_size:
                 break
             start += page_size
 
-    return pd.DataFrame(all_rows)
+    if not pages:
+        return pd.DataFrame()
+    return pd.concat(pages, ignore_index=True)
 
 
 @st.cache_data(ttl=300)
@@ -129,35 +128,39 @@ def get_batting_innings():
 
 @st.cache_data(ttl=300)
 def get_deliveries_for_batter(batter_id: str):
-    all_rows = []
+    pages = []
     start = 0
     page_size = 1000
 
     while True:
-        resp = (
-            supabase.table("deliveries")
-            .select("*")
-            .eq("batter_id", batter_id)
-            .order("innings_id", desc=False)
-            .order("over", desc=False)
-            .order("ball_number", desc=False)
-            .range(start, start + page_size - 1)
-            .execute()
+        sql = """
+            SELECT * FROM deliveries
+            WHERE batter_id = :batter_id
+            ORDER BY innings_id, over, ball_number
+            LIMIT :limit OFFSET :offset
+        """
+        df_page = conn.query(
+            sql,
+            params={"batter_id": batter_id, "limit": page_size, "offset": start},
+            ttl=0,
         )
-        rows = resp.data or []
-        all_rows.extend(rows)
-        if len(rows) < page_size:
+        if df_page.empty:
+            break
+        pages.append(df_page)
+        if len(df_page) < page_size:
             break
         start += page_size
 
-    return pd.DataFrame(all_rows)
+    if not pages:
+        return pd.DataFrame()
+    return pd.concat(pages, ignore_index=True)
 
 
 @st.cache_data(ttl=300)
 def get_highlights():
     """
     Highlight clips (fours, sixes, dismissals, etc.) with video URLs.
-    Paginated fetch to avoid PostgREST's default 1000-row cap.
+    Paginated fetch to avoid pulling an unbounded result set in one query.
     """
     return fetch_all_rows("highlights", "*")
 
@@ -168,7 +171,7 @@ def get_bowling_deliveries():
     Legal deliveries (wides = 0) at bowler grain — just enough columns to
     count balls bowled per bowler and join to matches for the grade filter.
     Uses keyset pagination (id_col="ball_id") since `deliveries` is large
-    enough that offset-based pagination times out.
+    enough that offset-based pagination gets slow deep into the table.
     """
     return fetch_all_rows(
         "deliveries",
@@ -186,7 +189,7 @@ def get_player_style():
 
 def add_season_column(df: pd.DataFrame, date_col: str = "day_1_start") -> pd.DataFrame:
     """
-    Add season column with July–June seasons, formatted as 'YYYY/YYYY'.
+    Add season column with July-June seasons, formatted as 'YYYY/YYYY'.
     """
     if df.empty or date_col not in df.columns:
         return df
@@ -201,7 +204,7 @@ def add_season_column(df: pd.DataFrame, date_col: str = "day_1_start") -> pd.Dat
     return df
 
 
-SEGMENT_ORDER = ["1–10", "11–20", "21–30", "31–50", "51–75", "76+"]
+SEGMENT_ORDER = ["1\u201310", "11\u201320", "21\u201330", "31\u201350", "51\u201375", "76+"]
 
 
 def sanitize_multiselect_state(key: str, valid_options: list) -> None:
@@ -220,15 +223,6 @@ def cascading_multiselect(container, label: str, options: list, key: str,
     """
     Multiselect for a cascading filter chain. Sanitizes stored state against
     the current options list, then creates the widget.
-
-    Important: `default` is only passed the very first time the widget is
-    created (i.e. before session_state[key] exists). Passing `default` on a
-    later run, after sanitize_multiselect_state has already written to
-    session_state[key], makes Streamlit think the value was set two
-    different ways in the same run and triggers a
-    "created with a default value but also had its value set via the
-    Session State API" warning — so we omit `default` on every run after
-    the first.
     """
     sanitize_multiselect_state(key, options)
     kwargs = {}
@@ -239,20 +233,19 @@ def cascading_multiselect(container, label: str, options: list, key: str,
 
 def segment_label(ball_index: int) -> str:
     if ball_index <= 10:
-        return "1–10"
+        return "1\u201310"
     elif ball_index <= 20:
-        return "11–20"
+        return "11\u201320"
     elif ball_index <= 30:
-        return "21–30"
+        return "21\u201330"
     elif ball_index <= 50:
-        return "31–50"
+        return "31\u201350"
     elif ball_index <= 75:
-        return "51–75"
+        return "51\u201375"
     else:
         return "76+"
-        
-        
-        
+
+
 # ---------- Batting tab ----------
 
 def batting_tab():
@@ -297,7 +290,7 @@ def batting_tab():
         .tolist()
     )
     selected_season = cascading_multiselect(
-        st.sidebar, "Season (July–June)", season_options, "filter_season"
+        st.sidebar, "Season (July\u2013June)", season_options, "filter_season"
     )
     if selected_season:
         stage_df = stage_df[stage_df["season"].isin(selected_season)]
@@ -389,13 +382,13 @@ def batting_tab():
     # Format: average 2dp, SR & BPD 0dp
     display_df = grouped.copy()
     display_df["average"] = display_df["average"].apply(
-        lambda x: f"{x:.2f}" if pd.notna(x) else "–"
+        lambda x: f"{x:.2f}" if pd.notna(x) else "\u2013"
     )
     display_df["strike_rate"] = display_df["strike_rate"].apply(
-        lambda x: f"{x:.0f}" if pd.notna(x) else "–"
+        lambda x: f"{x:.0f}" if pd.notna(x) else "\u2013"
     )
     display_df["BPD"] = display_df["BPD"].apply(
-        lambda x: f"{x:.0f}" if pd.notna(x) else "–"
+        lambda x: f"{x:.0f}" if pd.notna(x) else "\u2013"
     )
 
     st.subheader("Batting summary (filtered)")
@@ -410,21 +403,21 @@ def batting_tab():
     if selected_batter_id is not None:
         selected_row = grouped[grouped["player_id"] == selected_batter_id].iloc[0]
 
-        st.subheader(f"Batter detail — {selected_row['player_name']}")
+        st.subheader(f"Batter detail \u2014 {selected_row['player_name']}")
 
         col1, col2, col3 = st.columns(3)
         col1.metric("Total runs", int(selected_row["total_runs"]))
         col2.metric(
             "Average",
-            f"{selected_row['average']:.2f}" if pd.notna(selected_row["average"]) else "–",
+            f"{selected_row['average']:.2f}" if pd.notna(selected_row["average"]) else "\u2013",
         )
         col3.metric(
             "Strike rate",
-            f"{selected_row['strike_rate']:.0f}" if pd.notna(selected_row["strike_rate"]) else "–",
+            f"{selected_row['strike_rate']:.0f}" if pd.notna(selected_row["strike_rate"]) else "\u2013",
         )
 
         # ---------- 10-ball segments from deliveries ----------
-        st.subheader("Ball‑segment breakdown (deliveries)")
+        st.subheader("Ball\u2011segment breakdown (deliveries)")
 
         deliveries_df = get_deliveries_for_batter(str(selected_batter_id))
         if deliveries_df.empty:
@@ -470,10 +463,10 @@ def batting_tab():
 
             seg_display = seg.copy()
             seg_display["strike_rate"] = seg_display["strike_rate"].apply(
-                lambda x: f"{x:.0f}" if pd.notna(x) else "–"
+                lambda x: f"{x:.0f}" if pd.notna(x) else "\u2013"
             )
             seg_display["BPD"] = seg_display["BPD"].apply(
-                lambda x: f"{x:.0f}" if pd.notna(x) else "–"
+                lambda x: f"{x:.0f}" if pd.notna(x) else "\u2013"
             )
 
             st.dataframe(seg_display, width='stretch')
@@ -486,18 +479,12 @@ def batting_tab():
                 title=f"Strike rate by ball segment for {selected_row['player_name']}",
             )
             st.plotly_chart(fig_seg, width='stretch')
-            
-            
-            
-    # ---------- Dismissal type distribution — player vs population ----------
-        # Dismissal type distribution — player vs population
-        st.subheader("Dismissal type distribution — player vs population")
 
-        # population_df already reflects grade/match type/season/bowling type &
-        # style/opponent filters (computed once, above, before the batter filter)
+        # ---------- Dismissal type distribution — player vs population ----------
+        st.subheader("Dismissal type distribution \u2014 player vs population")
+
         pop_innings = population_df
 
-        # Exclude did not bat and not out
         excluded_types = {"Did Not Bat", "did not bat", "DNB", "Not Out", "not out"}
         pop_dismiss_df = pop_innings[
             pop_innings["dismissal_type"].notna()
@@ -514,7 +501,6 @@ def batting_tab():
         if pop_dismiss_df.empty or player_dismiss_df.empty or selected_batter_id is None:
             st.info("Not enough dismissal data to compare player vs population.")
         else:
-            # All dismissal types present in either set
             all_types = sorted(
                 pd.concat(
                     [pop_dismiss_df["dismissal_type"], player_dismiss_df["dismissal_type"]],
@@ -555,7 +541,7 @@ def batting_tab():
                 y="percentage",
                 color="group",
                 barmode="group",
-                title="Dismissal type % — player vs population",
+                title="Dismissal type % \u2014 player vs population",
             )
             st.plotly_chart(fig_comp, width='stretch')
 
@@ -598,13 +584,13 @@ def batting_tab():
             "Population avg fours/100 balls",
             f"{pop_boundary['fours_per_100_balls'].mean():.2f}"
             if pop_boundary["fours_per_100_balls"].notna().any()
-            else "–",
+            else "\u2013",
         )
         pcol2.metric(
             "Population avg sixes/100 balls",
             f"{pop_boundary['sixes_per_100_balls'].mean():.2f}"
             if pop_boundary["sixes_per_100_balls"].notna().any()
-            else "–",
+            else "\u2013",
         )
 
         if selected_batter_id is not None:
@@ -615,13 +601,13 @@ def batting_tab():
                 "Fours per 100 balls (batter)",
                 f"{batter_boundary_row['fours_per_100_balls']:.2f}"
                 if pd.notna(batter_boundary_row["fours_per_100_balls"])
-                else "–",
+                else "\u2013",
             )
             bcol2.metric(
                 "Sixes per 100 balls (batter)",
                 f"{batter_boundary_row['sixes_per_100_balls']:.2f}"
                 if pd.notna(batter_boundary_row["sixes_per_100_balls"])
-                else "–",
+                else "\u2013",
             )
 
         # Metrics by batting position
@@ -644,7 +630,6 @@ def batting_tab():
             lambda r: 100 * r["runs"] / r["balls"] if r["balls"] > 0 else None,
             axis=1,
         )
-        # Correct: per 100 balls, not above 100
         pos["fours_per_100_balls"] = pos.apply(
             lambda r: 100 * r["fours"] / r["balls"] if r["balls"] > 0 else None,
             axis=1,
@@ -656,16 +641,16 @@ def batting_tab():
 
         pos_display = pos.copy()
         pos_display["average"] = pos_display["average"].apply(
-            lambda x: f"{x:.2f}" if pd.notna(x) else "–"
+            lambda x: f"{x:.2f}" if pd.notna(x) else "\u2013"
         )
         pos_display["strike_rate"] = pos_display["strike_rate"].apply(
-            lambda x: f"{x:.0f}" if pd.notna(x) else "–"
+            lambda x: f"{x:.0f}" if pd.notna(x) else "\u2013"
         )
         pos_display["fours_per_100_balls"] = pos_display["fours_per_100_balls"].apply(
-            lambda x: f"{x:.2f}" if pd.notna(x) else "–"
+            lambda x: f"{x:.2f}" if pd.notna(x) else "\u2013"
         )
         pos_display["sixes_per_100_balls"] = pos_display["sixes_per_100_balls"].apply(
-            lambda x: f"{x:.2f}" if pd.notna(x) else "–"
+            lambda x: f"{x:.2f}" if pd.notna(x) else "\u2013"
         )
 
         st.dataframe(
@@ -683,7 +668,6 @@ def batting_tab():
         if highlights_df.empty:
             st.info("No highlights available.")
         else:
-            # Join to matches for season, grade, match_type
             matches_df = get_matches()
             highlights_df = highlights_df.merge(
                 matches_df[["match_id", "grade", "match_type", "day_1_start"]],
@@ -692,7 +676,6 @@ def batting_tab():
             )
             highlights_df = add_season_column(highlights_df, "day_1_start")
 
-            # Apply same filters (grade, match_type, season, opponent is implicit via match)
             h_filtered = highlights_df.copy()
             if selected_grade:
                 h_filtered = h_filtered[h_filtered["grade"].isin(selected_grade)]
@@ -701,11 +684,9 @@ def batting_tab():
             if selected_season:
                 h_filtered = h_filtered[h_filtered["season"].isin(selected_season)]
 
-            # Filter by batter if selected
             if selected_batter_id is not None:
                 h_filtered = h_filtered[h_filtered["batter_id"] == str(selected_batter_id)]
 
-            # Extra filter for highlight type: fours, sixes, dismissals
             st.markdown("Highlight type filter")
             highlight_type_options = ["All", "Fours", "Sixes", "Dismissals"]
             selected_h_type = st.selectbox("Highlight category", highlight_type_options, index=0)
@@ -727,14 +708,11 @@ def batting_tab():
             if h_filtered.empty:
                 st.info("No highlights match the current filters.")
             else:
-                # Sort: most recent match first, then chronological order within the match
                 h_sorted = h_filtered.sort_values(
                     ["day_1_start", "innings_number", "over", "ball_number"],
                     ascending=[False, True, True, True],
                 ).reset_index(drop=True)
 
-                # Keep the current selection valid as filters change; default to
-                # the most recent highlight.
                 default_id = h_sorted.iloc[0]["highlight_id"]
                 if (
                     "selected_highlight_id" not in st.session_state
@@ -745,9 +723,7 @@ def batting_tab():
                 list_col, video_col = st.columns([3, 2])
 
                 with list_col:
-                    st.caption(f"{len(h_sorted)} highlights — tap ▶ to play")
-                    # Fixed-height scrollable container holds the FULL list (not just
-                    # a top-10 slice), so it works the same on desktop and mobile.
+                    st.caption(f"{len(h_sorted)} highlights \u2014 tap \u25b6 to play")
                     with st.container(height=480):
                         for _, row in h_sorted.iterrows():
                             hl_id = row["highlight_id"]
@@ -760,13 +736,13 @@ def batting_tab():
                                 )
                                 st.markdown(
                                     f"**{row.get('batter', '')}** vs {row.get('bowler', '')} "
-                                    f"— {row.get('highlight_type', '')}  \n"
+                                    f"\u2014 {row.get('highlight_type', '')}  \n"
                                     f"{row.get('description', '')}  \n"
                                     f"<span style='color:gray;font-size:0.8em'>{date_str}</span>",
                                     unsafe_allow_html=True,
                                 )
                             with row_btn_col:
-                                if st.button("▶", key=f"play_{hl_id}"):
+                                if st.button("\u25b6", key=f"play_{hl_id}"):
                                     st.session_state["selected_highlight_id"] = hl_id
                             st.divider()
 
@@ -802,8 +778,6 @@ def bowler_style_tab():
         return
 
     matches_df = get_matches()
-    # get_matches() returns day_1_start as a raw string from Supabase — convert
-    # to real datetimes here so we can sort/format dates below.
     matches_df["day_1_start"] = pd.to_datetime(matches_df["day_1_start"])
 
     deliveries_df = deliveries_df.merge(
@@ -830,8 +804,6 @@ def bowler_style_tab():
     if selected_grade:
         d_filtered = d_filtered[d_filtered["grade"].isin(selected_grade)]
 
-    # Legal deliveries only — already filtered server-side (wides = 0) in
-    # get_bowling_deliveries(), just drop any rows with no bowler recorded.
     d_filtered = d_filtered[d_filtered["bowler_id"].notna()]
 
     if d_filtered.empty:
@@ -863,8 +835,6 @@ def bowler_style_tab():
 
     st.caption(f"{len(bowler_summary)} bowlers")
 
-    # Option lists: the fixed standard values, plus anything already in the
-    # data (in case older/other values are present) so nothing gets hidden.
     pace_spin_opts = sorted(set(PACE_SPIN_OPTIONS) | set(style_df["pace_spin"].dropna().unique().tolist()))
     bowl_hand_opts = sorted(set(BOWL_HAND_OPTIONS) | set(style_df["bowl_hand"].dropna().unique().tolist()))
     bowl_style_opts = sorted(set(BOWL_STYLE_OPTIONS) | set(style_df["bowl_style"].dropna().unique().tolist()))
@@ -876,13 +846,11 @@ def bowler_style_tab():
         st.session_state["selected_bowler_id"] = bowler_summary.iloc[0]["bowler_id"]
 
     def _dropdown_index(options, current_value):
-        full_options = ["–"] + options
+        full_options = ["\u2013"] + options
         if pd.notna(current_value) and current_value in options:
             return full_options.index(current_value)
         return 0
 
-    # Bowler list (left) and highlights + video (right), side by side, so
-    # picking a bowler's highlights never requires scrolling down the page.
     PANEL_HEIGHT = 560
     list_col, highlight_col = st.columns([3, 2])
 
@@ -890,47 +858,58 @@ def bowler_style_tab():
         with st.container(height=PANEL_HEIGHT):
             for _, row in bowler_summary.iterrows():
                 bid = row["bowler_id"]
-                st.markdown(f"**{row['bowler_name']}** — {int(row['balls'])} balls")
+                st.markdown(f"**{row['bowler_name']}** \u2014 {int(row['balls'])} balls")
 
                 c_ps, c_hand, c_style, c_save, c_select = st.columns([1, 1, 1, 1, 1])
                 with c_ps:
                     ps_val = st.selectbox(
-                        "Pace/Spin", ["–"] + pace_spin_opts,
+                        "Pace/Spin", ["\u2013"] + pace_spin_opts,
                         index=_dropdown_index(pace_spin_opts, row.get("pace_spin")),
                         key=f"ps_{bid}", label_visibility="collapsed",
                     )
                 with c_hand:
                     hand_val = st.selectbox(
-                        "Hand", ["–"] + bowl_hand_opts,
+                        "Hand", ["\u2013"] + bowl_hand_opts,
                         index=_dropdown_index(bowl_hand_opts, row.get("bowl_hand")),
                         key=f"hand_{bid}", label_visibility="collapsed",
                     )
                 with c_style:
                     style_val = st.selectbox(
-                        "Style", ["–"] + bowl_style_opts,
+                        "Style", ["\u2013"] + bowl_style_opts,
                         index=_dropdown_index(bowl_style_opts, row.get("bowl_style")),
                         key=f"style_{bid}", label_visibility="collapsed",
                     )
                 with c_save:
-                    if st.button("💾", key=f"save_{bid}", help="Save style"):
+                    if st.button("\U0001F4BE", key=f"save_{bid}", help="Save style"):
                         payload = {
                             "player_id": str(bid),
-                            "pace_spin": None if ps_val == "–" else ps_val,
-                            "bowl_hand": None if hand_val == "–" else hand_val,
-                            "bowl_style": None if style_val == "–" else style_val,
+                            "pace_spin": None if ps_val == "\u2013" else ps_val,
+                            "bowl_hand": None if hand_val == "\u2013" else hand_val,
+                            "bowl_style": None if style_val == "\u2013" else style_val,
                         }
                         try:
-                            supabase.table("player_style").upsert(
-                                payload, on_conflict="player_id"
-                            ).execute()
+                            with conn.session as s:
+                                s.execute(
+                                    text(
+                                        """
+                                        INSERT INTO player_style (player_id, pace_spin, bowl_hand, bowl_style)
+                                        VALUES (:player_id, :pace_spin, :bowl_hand, :bowl_style)
+                                        ON CONFLICT (player_id) DO UPDATE SET
+                                            pace_spin = EXCLUDED.pace_spin,
+                                            bowl_hand = EXCLUDED.bowl_hand,
+                                            bowl_style = EXCLUDED.bowl_style
+                                        """
+                                    ),
+                                    payload,
+                                )
+                                s.commit()
                             st.success(f"Saved {row['bowler_name']}")
                             get_player_style.clear()
                         except Exception as e:
                             st.error(f"Save failed: {e}")
                 with c_select:
-                    if st.button("▶", key=f"sel_{bid}", help="Show highlights"):
+                    if st.button("\u25b6", key=f"sel_{bid}", help="Show highlights"):
                         st.session_state["selected_bowler_id"] = bid
-
                 st.divider()
 
     # ---- Highlights panel for the selected bowler (next to the list, not below it) ----
@@ -938,7 +917,7 @@ def bowler_style_tab():
         selected_row = bowler_summary[
             bowler_summary["bowler_id"] == st.session_state["selected_bowler_id"]
         ].iloc[0]
-        st.subheader(f"Highlights — {selected_row['bowler_name']}")
+        st.subheader(f"Highlights \u2014 {selected_row['bowler_name']}")
 
         highlights_df = get_highlights()
         bowler_highlights = highlights_df[
@@ -963,10 +942,8 @@ def bowler_style_tab():
         ):
             st.session_state["selected_bowler_highlight_id"] = bh_sorted.iloc[0]["highlight_id"]
 
-        st.caption(f"{len(bh_sorted)} highlights — tap ▶ to play")
+        st.caption(f"{len(bh_sorted)} highlights \u2014 tap \u25b6 to play")
 
-        # Mini list (top) + video (bottom), stacked within this same column so
-        # both are visible next to the bowler list without scrolling the page.
         list_height = 200
         with st.container(height=list_height):
             for _, hrow in bh_sorted.iterrows():
@@ -979,13 +956,13 @@ def bowler_style_tab():
                         else ""
                     )
                     st.markdown(
-                        f"**{hrow.get('batter', '')}** — {hrow.get('highlight_type', '')}  \n"
+                        f"**{hrow.get('batter', '')}** \u2014 {hrow.get('highlight_type', '')}  \n"
                         f"{hrow.get('description', '')}  \n"
                         f"<span style='color:gray;font-size:0.8em'>{date_str}</span>",
                         unsafe_allow_html=True,
                     )
                 with btn_col:
-                    if st.button("▶", key=f"bowlerhl_play_{hid}"):
+                    if st.button("\u25b6", key=f"bowlerhl_play_{hid}"):
                         st.session_state["selected_bowler_highlight_id"] = hid
                 st.divider()
 
