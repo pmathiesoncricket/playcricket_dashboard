@@ -3,3 +3,5 @@ supabase
 pandas
 plotly
 python-dotenv
+sqlalchemy
+psycopg2-binary
