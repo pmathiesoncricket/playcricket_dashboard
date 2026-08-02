@@ -19,15 +19,6 @@ MAROON_SHADES = ["#73173F", "#C97292", "#9E3A5D", "#4A0F29", "#D9A0B5"]
 # ---------- Helper functions ----------
 
 def _stringify_uuids(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    psycopg2/SQLAlchemy return PostgreSQL `uuid` columns as native
-    uuid.UUID objects by default. Supabase's PostgREST layer always
-    serialized them as plain strings instead, which the rest of this app's
-    filtering logic (e.g. `batter_id == str(selected_id)`) depends on.
-    This normalizes any uuid.UUID values back to plain strings immediately
-    after fetching, so every downstream comparison keeps working exactly
-    as it did against Supabase.
-    """
     for col in df.columns:
         non_null = df[col].dropna()
         if not non_null.empty and isinstance(non_null.iloc[0], uuid.UUID):
@@ -187,7 +178,7 @@ def add_season_column(df: pd.DataFrame, date_col: str = "day_1_start") -> pd.Dat
     return df
 
 
-SEGMENT_ORDER = ["1\u201310", "11\u201320", "21\u201330", "31\u201350", "51\u201375", "76+"]
+SEGMENT_ORDER = ["1–10", "11–20", "21–30", "31–50", "51–75", "76+"]
 
 
 def sanitize_multiselect_state(key: str, valid_options: list) -> None:
@@ -206,15 +197,15 @@ def cascading_multiselect(container, label: str, options: list, key: str,
 
 def segment_label(ball_index: int) -> str:
     if ball_index <= 10:
-        return "1\u201310"
+        return "1–10"
     elif ball_index <= 20:
-        return "11\u201320"
+        return "11–20"
     elif ball_index <= 30:
-        return "21\u201330"
+        return "21–30"
     elif ball_index <= 50:
-        return "31\u201350"
+        return "31–50"
     elif ball_index <= 75:
-        return "51\u201375"
+        return "51–75"
     else:
         return "76+"
 
@@ -259,7 +250,7 @@ def batting_tab():
         .tolist()
     )
     selected_season = cascading_multiselect(
-        st.sidebar, "Season (July\u2013June)", season_options, "filter_season"
+        st.sidebar, "Season (July–June)", season_options, "filter_season"
     )
     if selected_season:
         stage_df = stage_df[stage_df["season"].isin(selected_season)]
@@ -290,11 +281,23 @@ def batting_tab():
     # Batter filter moved here (main panel, above the summary table) instead
     # of the sidebar — the sidebar stack was tall enough that this dropdown's
     # menu rendered partially off-screen with nowhere to open. This also
-    # co-locates it with the new "click a row to filter" behaviour below.
+    # co-locates it with the "click a row to filter" behaviour below.
     grouped_all = stage_df.groupby("player_id").agg(
         player_name=("player_name", "first"),
     ).reset_index()
     batter_options = sorted(grouped_all["player_name"].dropna().tolist())
+
+    # Streamlit forbids writing to st.session_state["filter_batter"] after
+    # the selectbox with that key has already been instantiated in the
+    # current run -- even if immediately followed by st.rerun(). So a
+    # table-row click (further down) stages its target name in
+    # "pending_batter_filter" instead of writing "filter_batter" directly.
+    # Here, BEFORE the selectbox is created, we promote that staged value
+    # into the real widget key -- legal because it happens prior to the
+    # widget's instantiation in this fresh run.
+    if "pending_batter_filter" in st.session_state:
+        st.session_state["filter_batter"] = st.session_state.pop("pending_batter_filter")
+
     if "filter_batter" in st.session_state and st.session_state["filter_batter"] not in (
         ["All batters"] + batter_options
     ):
@@ -306,7 +309,7 @@ def batting_tab():
 
     st.subheader("Batting summary (filtered)")
     selected_batter_name = st.selectbox(
-        "Batter (applies to whole page) \u2014 or click a row below",
+        "Batter (applies to whole page) — or click a row below",
         options=["All batters"] + batter_options,
         index=0,
         key="filter_batter",
@@ -348,13 +351,13 @@ def batting_tab():
 
     display_df = grouped.copy()
     display_df["average"] = display_df["average"].apply(
-        lambda x: f"{x:.2f}" if pd.notna(x) else "\u2013"
+        lambda x: f"{x:.2f}" if pd.notna(x) else "–"
     )
     display_df["strike_rate"] = display_df["strike_rate"].apply(
-        lambda x: f"{x:.0f}" if pd.notna(x) else "\u2013"
+        lambda x: f"{x:.0f}" if pd.notna(x) else "–"
     )
     display_df["BPD"] = display_df["BPD"].apply(
-        lambda x: f"{x:.0f}" if pd.notna(x) else "\u2013"
+        lambda x: f"{x:.0f}" if pd.notna(x) else "–"
     )
 
     summary_table = display_df[
@@ -378,26 +381,26 @@ def batting_tab():
         clicked_idx = summary_event.selection.rows[0]
         clicked_name = summary_table.iloc[clicked_idx]["player_name"]
         if st.session_state.get("filter_batter") != clicked_name:
-            st.session_state["filter_batter"] = clicked_name
+            st.session_state["pending_batter_filter"] = clicked_name
             st.rerun()
 
     if selected_batter_id is not None:
         selected_row = grouped[grouped["player_id"] == selected_batter_id].iloc[0]
 
-        st.subheader(f"Batter detail \u2014 {selected_row['player_name']}")
+        st.subheader(f"Batter detail — {selected_row['player_name']}")
 
         col1, col2, col3 = st.columns(3)
         col1.metric("Total runs", int(selected_row["total_runs"]))
         col2.metric(
             "Average",
-            f"{selected_row['average']:.2f}" if pd.notna(selected_row["average"]) else "\u2013",
+            f"{selected_row['average']:.2f}" if pd.notna(selected_row["average"]) else "–",
         )
         col3.metric(
             "Strike rate",
-            f"{selected_row['strike_rate']:.0f}" if pd.notna(selected_row["strike_rate"]) else "\u2013",
+            f"{selected_row['strike_rate']:.0f}" if pd.notna(selected_row["strike_rate"]) else "–",
         )
 
-        st.subheader("Ball\u2011segment breakdown (deliveries)")
+        st.subheader("Ball‑segment breakdown (deliveries)")
 
         deliveries_df = get_deliveries_for_batter(str(selected_batter_id))
         if deliveries_df.empty:
@@ -444,10 +447,10 @@ def batting_tab():
 
             seg_display = seg.copy()
             seg_display["strike_rate"] = seg_display["strike_rate"].apply(
-                lambda x: f"{x:.0f}" if pd.notna(x) else "\u2013"
+                lambda x: f"{x:.0f}" if pd.notna(x) else "–"
             )
             seg_display["BPD"] = seg_display["BPD"].apply(
-                lambda x: f"{x:.0f}" if pd.notna(x) else "\u2013"
+                lambda x: f"{x:.0f}" if pd.notna(x) else "–"
             )
 
             st.dataframe(seg_display, width='stretch')
@@ -496,16 +499,16 @@ def batting_tab():
 
             by_style_display = by_style.copy()
             by_style_display["average"] = by_style_display["average"].apply(
-                lambda x: f"{x:.2f}" if pd.notna(x) else "\u2013"
+                lambda x: f"{x:.2f}" if pd.notna(x) else "–"
             )
             by_style_display["strike_rate"] = by_style_display["strike_rate"].apply(
-                lambda x: f"{x:.0f}" if pd.notna(x) else "\u2013"
+                lambda x: f"{x:.0f}" if pd.notna(x) else "–"
             )
             by_style_display["BPD"] = by_style_display["BPD"].apply(
-                lambda x: f"{x:.0f}" if pd.notna(x) else "\u2013"
+                lambda x: f"{x:.0f}" if pd.notna(x) else "–"
             )
             by_style_display["boundary_rate"] = by_style_display["boundary_rate"].apply(
-                lambda x: f"{x:.1f}" if pd.notna(x) else "\u2013"
+                lambda x: f"{x:.1f}" if pd.notna(x) else "–"
             )
 
             st.dataframe(
@@ -536,7 +539,7 @@ def batting_tab():
         match_display = match_display.sort_values("day_1_start", ascending=False)
         match_display["day_1_start"] = pd.to_datetime(match_display["day_1_start"]).dt.strftime("%d %b %Y")
         match_display["SR"] = match_display["SR"].apply(
-            lambda x: f"{x:.0f}" if pd.notna(x) else "\u2013"
+            lambda x: f"{x:.0f}" if pd.notna(x) else "–"
         )
         match_display = match_display.rename(columns={
             "day_1_start": "Date", "match_name": "Match", "bat_position": "Pos",
@@ -545,7 +548,7 @@ def batting_tab():
 
         st.dataframe(match_display, width='stretch', hide_index=True)
 
-        st.subheader("Dismissal type distribution \u2014 player vs population")
+        st.subheader("Dismissal type distribution — player vs population")
 
         pop_innings = population_df
 
@@ -605,7 +608,7 @@ def batting_tab():
                 y="percentage",
                 color="group",
                 barmode="group",
-                title="Dismissal type % \u2014 player vs population",
+                title="Dismissal type % — player vs population",
                 color_discrete_sequence=MAROON_SHADES[:2],
             )
             st.plotly_chart(fig_comp, width='stretch')
@@ -650,13 +653,13 @@ def batting_tab():
             "Population avg fours/100 balls",
             f"{pop_boundary['fours_per_100_balls'].mean():.2f}"
             if pop_boundary["fours_per_100_balls"].notna().any()
-            else "\u2013",
+            else "–",
         )
         pcol2.metric(
             "Population avg sixes/100 balls",
             f"{pop_boundary['sixes_per_100_balls'].mean():.2f}"
             if pop_boundary["sixes_per_100_balls"].notna().any()
-            else "\u2013",
+            else "–",
         )
 
         if selected_batter_id is not None:
@@ -667,13 +670,13 @@ def batting_tab():
                 "Fours per 100 balls (batter)",
                 f"{batter_boundary_row['fours_per_100_balls']:.2f}"
                 if pd.notna(batter_boundary_row["fours_per_100_balls"])
-                else "\u2013",
+                else "–",
             )
             bcol2.metric(
                 "Sixes per 100 balls (batter)",
                 f"{batter_boundary_row['sixes_per_100_balls']:.2f}"
                 if pd.notna(batter_boundary_row["sixes_per_100_balls"])
-                else "\u2013",
+                else "–",
             )
 
         st.subheader("Metrics by batting position")
@@ -706,16 +709,16 @@ def batting_tab():
 
         pos_display = pos.copy()
         pos_display["average"] = pos_display["average"].apply(
-            lambda x: f"{x:.2f}" if pd.notna(x) else "\u2013"
+            lambda x: f"{x:.2f}" if pd.notna(x) else "–"
         )
         pos_display["strike_rate"] = pos_display["strike_rate"].apply(
-            lambda x: f"{x:.0f}" if pd.notna(x) else "\u2013"
+            lambda x: f"{x:.0f}" if pd.notna(x) else "–"
         )
         pos_display["fours_per_100_balls"] = pos_display["fours_per_100_balls"].apply(
-            lambda x: f"{x:.2f}" if pd.notna(x) else "\u2013"
+            lambda x: f"{x:.2f}" if pd.notna(x) else "–"
         )
         pos_display["sixes_per_100_balls"] = pos_display["sixes_per_100_balls"].apply(
-            lambda x: f"{x:.2f}" if pd.notna(x) else "\u2013"
+            lambda x: f"{x:.2f}" if pd.notna(x) else "–"
         )
 
         st.dataframe(
@@ -787,7 +790,7 @@ def batting_tab():
                 list_col, video_col = st.columns([3, 2])
 
                 with list_col:
-                    st.caption(f"{len(h_sorted)} highlights \u2014 tap \u25b6 to play")
+                    st.caption(f"{len(h_sorted)} highlights — tap ▶ to play")
                     with st.container(height=480):
                         for _, row in h_sorted.iterrows():
                             hl_id = row["highlight_id"]
@@ -800,13 +803,13 @@ def batting_tab():
                                 )
                                 st.markdown(
                                     f"**{row.get('batter', '')}** vs {row.get('bowler', '')} "
-                                    f"\u2014 {row.get('highlight_type', '')}  \n"
+                                    f"— {row.get('highlight_type', '')}  \n"
                                     f"{row.get('description', '')}  \n"
                                     f"<span style='color:gray;font-size:0.8em'>{date_str}</span>",
                                     unsafe_allow_html=True,
                                 )
                             with row_btn_col:
-                                if st.button("\u25b6", key=f"play_{hl_id}"):
+                                if st.button("▶", key=f"play_{hl_id}"):
                                     st.session_state["selected_highlight_id"] = hl_id
                             st.divider()
 
@@ -913,7 +916,7 @@ def bowler_style_tab():
         st.session_state["selected_bowler_id"] = bowler_summary.iloc[0]["bowler_id"]
 
     def _dropdown_index(options, current_value):
-        full_options = ["\u2013"] + options
+        full_options = ["–"] + options
         if pd.notna(current_value) and current_value in options:
             return full_options.index(current_value)
         return 0
@@ -922,34 +925,34 @@ def bowler_style_tab():
     list_col, highlight_col = st.columns([2, 3])
 
     with list_col:
-        save_clicked = st.button("\U0001F4BE Save all changes", key="save_all_styles", type="primary")
+        save_clicked = st.button("💾 Save all changes", key="save_all_styles", type="primary")
 
         with st.container(height=PANEL_HEIGHT):
             for _, row in bowler_summary.iterrows():
                 bid = row["bowler_id"]
-                st.markdown(f"**{row['bowler_name']}** \u2014 {int(row['balls'])} balls")
+                st.markdown(f"**{row['bowler_name']}** — {int(row['balls'])} balls")
 
                 c_ps, c_hand, c_style, c_select = st.columns([1, 1, 1, 1])
                 with c_ps:
                     st.selectbox(
-                        "Pace/Spin", ["\u2013"] + pace_spin_opts,
+                        "Pace/Spin", ["–"] + pace_spin_opts,
                         index=_dropdown_index(pace_spin_opts, row.get("pace_spin")),
                         key=f"ps_{bid}", label_visibility="collapsed",
                     )
                 with c_hand:
                     st.selectbox(
-                        "Hand", ["\u2013"] + bowl_hand_opts,
+                        "Hand", ["–"] + bowl_hand_opts,
                         index=_dropdown_index(bowl_hand_opts, row.get("bowl_hand")),
                         key=f"hand_{bid}", label_visibility="collapsed",
                     )
                 with c_style:
                     st.selectbox(
-                        "Style", ["\u2013"] + bowl_style_opts,
+                        "Style", ["–"] + bowl_style_opts,
                         index=_dropdown_index(bowl_style_opts, row.get("bowl_style")),
                         key=f"style_{bid}", label_visibility="collapsed",
                     )
                 with c_select:
-                    if st.button("\u25b6", key=f"sel_{bid}", help="Show highlights"):
+                    if st.button("▶", key=f"sel_{bid}", help="Show highlights"):
                         st.session_state["selected_bowler_id"] = bid
                 st.markdown(ROW_DIVIDER, unsafe_allow_html=True)
 
@@ -957,13 +960,13 @@ def bowler_style_tab():
             changed = []
             for _, row in bowler_summary.iterrows():
                 bid = row["bowler_id"]
-                ps_val = st.session_state.get(f"ps_{bid}", "\u2013")
-                hand_val = st.session_state.get(f"hand_{bid}", "\u2013")
-                style_val = st.session_state.get(f"style_{bid}", "\u2013")
+                ps_val = st.session_state.get(f"ps_{bid}", "–")
+                hand_val = st.session_state.get(f"hand_{bid}", "–")
+                style_val = st.session_state.get(f"style_{bid}", "–")
 
-                new_pace_spin = None if ps_val == "\u2013" else ps_val
-                new_bowl_hand = None if hand_val == "\u2013" else hand_val
-                new_bowl_style = None if style_val == "\u2013" else style_val
+                new_pace_spin = None if ps_val == "–" else ps_val
+                new_bowl_hand = None if hand_val == "–" else hand_val
+                new_bowl_style = None if style_val == "–" else style_val
 
                 orig_pace_spin = row.get("pace_spin") if pd.notna(row.get("pace_spin")) else None
                 orig_bowl_hand = row.get("bowl_hand") if pd.notna(row.get("bowl_hand")) else None
@@ -1005,7 +1008,7 @@ def bowler_style_tab():
         selected_row = bowler_summary[
             bowler_summary["bowler_id"] == st.session_state["selected_bowler_id"]
         ].iloc[0]
-        st.subheader(f"Highlights \u2014 {selected_row['bowler_name']}")
+        st.subheader(f"Highlights — {selected_row['bowler_name']}")
 
         highlights_df = get_highlights()
         bowler_highlights = highlights_df[
@@ -1030,7 +1033,7 @@ def bowler_style_tab():
         ):
             st.session_state["selected_bowler_highlight_id"] = bh_sorted.iloc[0]["highlight_id"]
 
-        st.caption(f"{len(bh_sorted)} highlights \u2014 tap \u25b6 to play")
+        st.caption(f"{len(bh_sorted)} highlights — tap ▶ to play")
 
         list_height = 200
         with st.container(height=list_height):
@@ -1045,13 +1048,13 @@ def bowler_style_tab():
                     )
                     home_team = hrow.get("home_team") or ""
                     st.markdown(
-                        f"**{hrow.get('batter', '')}** \u2014 {hrow.get('highlight_type', '')}  \n"
+                        f"**{hrow.get('batter', '')}** — {hrow.get('highlight_type', '')}  \n"
                         f"{hrow.get('description', '')}  \n"
-                        f"<span style='color:gray;font-size:0.8em'>{date_str} \u00b7 {home_team}</span>",
+                        f"<span style='color:gray;font-size:0.8em'>{date_str} · {home_team}</span>",
                         unsafe_allow_html=True,
                     )
                 with btn_col:
-                    if st.button("\u25b6", key=f"bowlerhl_play_{hid}"):
+                    if st.button("▶", key=f"bowlerhl_play_{hid}"):
                         st.session_state["selected_bowler_highlight_id"] = hid
                 st.markdown(ROW_DIVIDER, unsafe_allow_html=True)
 
