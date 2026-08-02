@@ -189,6 +189,41 @@ def get_bowler_summary():
     df = conn.query(sql, ttl=0)
     return _stringify_uuids(df)
 
+@st.cache_data(ttl=300)
+def get_highlights_for_bowlers(bowler_ids: tuple[str, ...], max_per_bowler: int = 10):
+    """
+    Fetch up to `max_per_bowler` highlights per bowler for the provided set
+    of bowlers, newest first within each bowler.
+    """
+    if not bowler_ids:
+        return pd.DataFrame()
+
+    sql = """
+        WITH ranked AS (
+            SELECT
+                h.*,
+                ROW_NUMBER() OVER (
+                    PARTITION BY h.bowler_id
+                    ORDER BY m.day_1_start DESC, h.innings_number, h.over, h.ball_number
+                ) AS rn
+            FROM highlights h
+            LEFT JOIN matches m ON m.match_id = h.match_id
+            WHERE h.bowler_id = ANY(:bowler_ids)
+        )
+        SELECT *
+        FROM ranked
+        WHERE rn <= :max_per_bowler
+        ORDER BY bowler_id, rn
+    """
+    df = conn.query(
+        sql,
+        params={
+            "bowler_ids": list(bowler_ids),
+            "max_per_bowler": max_per_bowler,
+        },
+        ttl=0,
+    )
+    return _stringify_uuids(df)
 
 @st.cache_data(ttl=300)
 def get_player_style():
