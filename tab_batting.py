@@ -7,6 +7,7 @@ from db import get_batting_innings, get_deliveries_for_batter, get_highlights, g
 from helpers import add_season_column, cascading_multiselect, segment_label, SEGMENT_ORDER, MAROON, MAROON_SHADES
 
 MAX_STREAM_GAP_HOURS = 18
+NBSP = "\u00A0"
 
 
 def build_timestamped_youtube_url(base_url, seconds):
@@ -26,14 +27,17 @@ def build_timestamped_youtube_url(base_url, seconds):
     return urlunparse((parsed.scheme, parsed.netloc, parsed.path, "", new_query, ""))
 
 
-def resolve_ball_video_url(ball_time, day1_url, day1_start, day2_url, day2_start):
+def resolve_ball_video_url(ball_time, day1_url, day1_start, day2_url, day2_start, offset_adjustment=-5):
     """
     Picks day1 or day2 stream based on how close the ball's timestamp is to
     each stream's start time (all values are UTC). A ball is considered to
     belong to a stream if it falls within MAX_STREAM_GAP_HOURS of that
     stream's start. Day 1 is checked first; day 2 is only used if day 1
     doesn't match. If neither stream is within range, falls back to day 1
-    (if a day 1 stream exists at all). Returns None if no stream is usable.
+    (if a day 1 stream exists at all). `offset_adjustment` is an extra
+    seconds nudge (positive or negative) to compensate for stream-specific
+    lag between the actual ball time and the video's timestamp. Returns
+    None if no stream is usable.
     """
     if pd.isna(ball_time):
         return None
@@ -62,8 +66,28 @@ def resolve_ball_video_url(ball_time, day1_url, day1_start, day2_url, day2_start
     else:
         return None
 
-    offset_seconds = (ball_time_ts - stream_start_ts).total_seconds() - 5
+    offset_seconds = (ball_time_ts - stream_start_ts).total_seconds() + offset_adjustment
     return build_timestamped_youtube_url(stream_url, offset_seconds)
+
+
+def _pad(text, width):
+    """Left-align/truncate `text` to a fixed character width using
+    non-breaking spaces for padding, so it stays visually aligned inside a
+    monospace-rendered markdown code span (regular spaces collapse in HTML)."""
+    text = "" if text is None else str(text)
+    if len(text) > width:
+        return text[: max(width - 1, 0)] + "\u2026"
+    return text + NBSP * (width - len(text))
+
+
+@st.dialog("Watch")
+def _play_video_dialog(url, description):
+    """Renders the selected ball's video in an in-page modal overlay instead
+    of a new browser tab, so users can flip between deliveries without
+    losing their place on the page (especially useful on mobile)."""
+    if description:
+        st.markdown(f"**{description}**")
+    st.video(url, autoplay=True)
 
 
 def batting_tab():
@@ -258,6 +282,14 @@ def batting_tab():
             deliveries_df["wides"] = deliveries_df["wides"].fillna(0)
             deliveries_df["legal_ball"] = deliveries_df["wides"] == 0
 
+            # Attach bowler pace/spin + bowling style to every delivery, so
+            # the ball-by-ball listing can show it and be filtered by the
+            # page-level "Bowling type" / "Bowling style" sidebar filters.
+            full_style_lookup = get_player_style()[["player_id", "pace_spin", "bowl_style"]].rename(
+                columns={"player_id": "bowler_id", "pace_spin": "bowler_pace_spin", "bowl_style": "bowler_bowl_style"}
+            )
+            deliveries_df = deliveries_df.merge(full_style_lookup, on="bowler_id", how="left")
+
             seg_df = deliveries_df.copy()
             seg_df["ball_index"] = (
                 seg_df.groupby("innings_id")["legal_ball"]
@@ -318,7 +350,9 @@ def batting_tab():
             style_lookup = get_player_style()[["player_id", "bowl_style"]].rename(
                 columns={"player_id": "bowler_id"}
             )
-            style_deliveries = deliveries_df.merge(style_lookup, on="bowler_id", how="left")
+            style_deliveries = deliveries_df.drop(columns=["bowl_style"], errors="ignore").merge(
+                style_lookup, on="bowler_id", how="left"
+            )
             style_deliveries["bowl_style"] = style_deliveries["bowl_style"].fillna("Unknown")
 
             legal = style_deliveries[style_deliveries["wides"] == 0].copy()
@@ -371,6 +405,18 @@ def batting_tab():
 
         st.subheader("Match-by-match batting")
 
+        offset_seconds_adjustment = st.number_input(
+            "Video timestamp offset (seconds)",
+            value=-5,
+            step=1,
+            help=(
+                "Fine-tune how far into the stream each ball's video link jumps. "
+                "Negative values start the clip slightly earlier; adjust to match "
+                "your streaming setup's lag."
+            ),
+            key="ball_video_offset_seconds",
+        )
+
         match_df = filtered.copy()
         match_df["boundaries"] = match_df["fours"].fillna(0) + match_df["sixes"].fillna(0)
         match_df["match_name"] = match_df["match_type"].astype(str) + " v " + match_df["opponent_team"].astype(str)
@@ -394,6 +440,13 @@ def batting_tab():
 
         st.caption(f"{len(match_rows)} innings \u2014 expand a row to see ball-by-ball detail and video links")
 
+        # Fixed-width header line so the aligned columns below have labels.
+        header_line = (
+            f"`{_pad('Date', 12)}{_pad('Match', 30)}{_pad('Pos', 6)}"
+            f"{_pad('Score', 12)}{_pad('SR', 6)}`"
+        )
+        st.markdown(header_line)
+
         for _, m_row in match_rows.iterrows():
             date_str = (
                 pd.to_datetime(m_row["day_1_start"]).strftime("%d %b %Y")
@@ -402,9 +455,18 @@ def batting_tab():
             sr_str = f"{m_row['SR']:.0f}" if pd.notna(m_row["SR"]) else "\u2013"
             runs_str = f"{int(m_row['runs'])}" if pd.notna(m_row["runs"]) else "\u2013"
             bf_str = f"{int(m_row['balls_faced'])}" if pd.notna(m_row["balls_faced"]) else "\u2013"
+            pos_str = f"Pos {m_row['bat_position']}" if pd.notna(m_row["bat_position"]) else "Pos \u2013"
+            score_str = f"{runs_str} ({bf_str})"
+            sr_display = f"SR {sr_str}"
+
+            # Each field is padded to a fixed character width with
+            # non-breaking spaces, then the whole line is wrapped in a
+            # markdown code span so it renders in a monospace font —
+            # giving column-like alignment inside an expander label,
+            # which can't otherwise host a real table.
             label = (
-                f"{date_str} \u2014 {m_row['match_name']} \u2014 Pos {m_row['bat_position']} \u2014 "
-                f"{runs_str} ({bf_str}) SR {sr_str}"
+                f"`{_pad(date_str, 12)}{_pad(m_row['match_name'], 30)}{_pad(pos_str, 6)}"
+                f"{_pad(score_str, 12)}{_pad(sr_display, 6)}`"
             )
 
             with st.expander(label):
@@ -417,11 +479,18 @@ def batting_tab():
                     & (deliveries_df["innings_id"] == m_row["innings_id"])
                 ].copy()
 
+                # Apply the page-level bowling type/style filters to the
+                # ball-by-ball listing, same as every other section on the page.
+                if selected_bowling_type:
+                    innings_balls = innings_balls[innings_balls["bowler_pace_spin"].isin(selected_bowling_type)]
+                if selected_bowl_style:
+                    innings_balls = innings_balls[innings_balls["bowler_bowl_style"].isin(selected_bowl_style)]
+
                 if innings_balls.empty:
-                    st.info("No ball-by-ball data available for this innings.")
+                    st.info("No ball-by-ball data available for this innings (with current bowling filters).")
                     continue
 
-                innings_balls = innings_balls.sort_values(["over", "ball_number"])
+                innings_balls = innings_balls.sort_values(["over", "ball_number"]).reset_index(drop=True)
 
                 match_stream_row = matches_stream_df[matches_stream_df["match_id"] == m_row["match_id"]]
                 day1_url = day1_start = day2_url = day2_start = None
@@ -433,31 +502,48 @@ def batting_tab():
                     day2_start = srow.get("day2_stream_start")
 
                 innings_balls["video_url"] = innings_balls["ball_time"].apply(
-                    lambda bt: resolve_ball_video_url(bt, day1_url, day1_start, day2_url, day2_start)
+                    lambda bt: resolve_ball_video_url(
+                        bt, day1_url, day1_start, day2_url, day2_start, offset_seconds_adjustment
+                    )
                 )
                 innings_balls["over_ball"] = (
                     innings_balls["over"].astype("Int64").astype(str) + "."
                     + innings_balls["ball_number"].astype("Int64").astype(str)
                 )
+                innings_balls["video_flag"] = innings_balls["video_url"].apply(
+                    lambda u: "\u25b6 Watch" if u else "\u2013"
+                )
 
                 ball_display = innings_balls[
-                    ["over_ball", "bowler", "batter_runs", "description", "video_url"]
+                    ["over_ball", "bowler", "bowler_pace_spin", "bowler_bowl_style",
+                     "batter_runs", "description", "video_flag"]
                 ].rename(columns={
                     "over_ball": "Over.Ball", "bowler": "Bowler",
-                    "batter_runs": "Runs", "description": "Description", "video_url": "Video",
+                    "bowler_pace_spin": "Type", "bowler_bowl_style": "Bowling style",
+                    "batter_runs": "Runs", "description": "Description", "video_flag": "Video",
                 })
 
-                st.dataframe(
+                ball_key = f"balls_{m_row['match_id']}_{m_row['innings_id']}"
+                ball_event = st.dataframe(
                     ball_display,
                     hide_index=True,
                     width='stretch',
-                    column_config={
-                        "Video": st.column_config.LinkColumn("Video", display_text="\u25b6 Watch"),
-                    },
+                    on_select="rerun",
+                    selection_mode="single-row",
+                    key=ball_key,
                 )
 
                 if day1_url is None and day2_url is None:
                     st.caption("No stream found for this match \u2014 video links unavailable.")
+                else:
+                    st.caption("Select a row with a video to play it in an overlay.")
+
+                if ball_event.selection.rows:
+                    sel_idx = ball_event.selection.rows[0]
+                    if sel_idx < len(innings_balls):
+                        sel_ball = innings_balls.iloc[sel_idx]
+                        if sel_ball["video_url"]:
+                            _play_video_dialog(sel_ball["video_url"], sel_ball.get("description"))
 
         st.subheader("Dismissal type distribution \u2014 player vs population")
 
