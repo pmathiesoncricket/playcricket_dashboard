@@ -159,10 +159,14 @@ def batting_tab():
 
     if summary_event.selection.rows:
         clicked_idx = summary_event.selection.rows[0]
-        clicked_name = summary_table.iloc[clicked_idx]["player_name"]
-        if st.session_state.get("filter_batter") != clicked_name:
-            st.session_state["pending_batter_filter"] = clicked_name
-            st.rerun()
+        if clicked_idx < len(summary_table):
+            clicked_name = summary_table.iloc[clicked_idx]["player_name"]
+            if st.session_state.get("filter_batter") != clicked_name:
+                st.session_state["pending_batter_filter"] = clicked_name
+                st.rerun()
+        else:
+            # Stale selection from a since-shrunk table — ignore it
+            pass
 
     if selected_batter_id is not None:
         selected_row = grouped[grouped["player_id"] == selected_batter_id].iloc[0]
