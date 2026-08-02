@@ -171,15 +171,16 @@ def get_highlights():
 @st.cache_data(ttl=300)
 def get_bowling_deliveries():
     """
-    Legal deliveries (wides = 0) at bowler grain — just enough columns to
-    count balls bowled per bowler and join to matches for the grade filter.
-    Uses keyset pagination (id_col="ball_id") since `deliveries` is large
-    enough that offset-based pagination gets slow deep into the table.
+    All deliveries at bowler grain — enough columns to count balls bowled
+    per bowler and join to matches for the grade filter. Wides/no-balls are
+    NOT filtered here; this is a raw count of deliveries bowled, not a
+    "balls faced" metric. Uses keyset pagination (id_col="ball_id") since
+    `deliveries` is large enough that offset-based pagination gets slow
+    deep into the table.
     """
     return fetch_all_rows(
         "deliveries",
         "ball_id, bowler_id, bowler, match_id",
-        eq_filters={"wides": 0},
         id_col="ball_id",
     )
 
