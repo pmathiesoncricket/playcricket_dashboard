@@ -1,8 +1,16 @@
+import math
+
 import streamlit as st
 import pandas as pd
 from sqlalchemy import text
 
-from db import conn, get_matches, get_bowler_summary, get_player_style, get_highlights
+from db import (
+    conn,
+    get_matches,
+    get_bowler_summary,
+    get_player_style,
+    get_highlights_for_bowlers,
+)
 
 PACE_SPIN_OPTIONS = ["Pace", "Spin"]
 BOWL_HAND_OPTIONS = ["Right", "Left"]
@@ -10,15 +18,14 @@ BOWL_STYLE_OPTIONS = ["Right Pace", "Left Pace", "LAOS", "Off Spin", "Leg Spin"]
 
 ROW_DIVIDER = "<hr style='margin:2px 0;border:none;border-top:1px solid #333;'>"
 MAX_HIGHLIGHTS = 10
+BOWLERS_PER_PAGE = 20
 
 
 def bowler_style_tab():
     st.header("Bowler Style")
     st.caption(
-        "Identify bowlers with missing style data, and set pace/spin, "
-        "bowling hand, and bowling style directly against each bowler. "
-        "Make changes across as many bowlers as you like, then click "
-        "'Save all changes' once to write everything in a single batch."
+        "Review bowlers with missing style data in pages of 20. "
+        "Each page preloads up to 10 highlights per visible bowler."
     )
 
     bowler_summary = get_bowler_summary()
@@ -38,12 +45,16 @@ def bowler_style_tab():
     filt_col1, filt_col2 = st.columns([2, 1])
     with filt_col1:
         selected_grade = st.multiselect(
-            "Grade", all_grades, default=[], key="bowler_filter_grade"
+            "Grade",
+            all_grades,
+            default=[],
+            key="bowler_filter_grade",
         )
     with filt_col2:
         style_status = st.selectbox(
             "Bowl style",
             ["All", "Populated", "Unpopulated"],
+            index=2,
             key="bowler_filter_style_status",
         )
 
@@ -77,7 +88,29 @@ def bowler_style_tab():
         st.info("No bowlers match the current filters.")
         return
 
-    st.caption(f"{len(bowler_summary)} bowlers")
+    total_bowlers = len(bowler_summary)
+    total_pages = max(1, math.ceil(total_bowlers / BOWLERS_PER_PAGE))
+
+    if "bowler_page_num" not in st.session_state:
+        st.session_state["bowler_page_num"] = 0
+
+    if st.session_state["bowler_page_num"] >= total_pages:
+        st.session_state["bowler_page_num"] = total_pages - 1
+
+    current_page = st.session_state["bowler_page_num"]
+    page_start = current_page * BOWLERS_PER_PAGE
+    page_end = page_start + BOWLERS_PER_PAGE
+
+    page_df = bowler_summary.iloc[page_start:page_end].copy().reset_index(drop=True)
+
+    if page_df.empty:
+        st.info("No bowlers on this page.")
+        return
+
+    st.caption(
+        f"{total_bowlers} bowlers • page {current_page + 1} of {total_pages} • "
+        f"showing {len(page_df)}"
+    )
 
     pace_spin_opts = sorted(
         set(PACE_SPIN_OPTIONS) | set(style_df["pace_spin"].dropna().unique().tolist())
@@ -89,16 +122,14 @@ def bowler_style_tab():
         set(BOWL_STYLE_OPTIONS) | set(style_df["bowl_style"].dropna().unique().tolist())
     )
 
-    bowler_ids = bowler_summary["bowler_id"].tolist()
+    page_bowler_ids = page_df["bowler_id"].tolist()
+    page_bowler_ids_str = tuple(str(x) for x in page_bowler_ids)
 
     if (
         "selected_bowler_id" not in st.session_state
-        or st.session_state["selected_bowler_id"] not in bowler_ids
+        or st.session_state["selected_bowler_id"] not in page_bowler_ids
     ):
-        st.session_state["selected_bowler_id"] = bowler_summary.iloc[0]["bowler_id"]
-
-    if "pending_selected_bowler_id" not in st.session_state:
-        st.session_state["pending_selected_bowler_id"] = st.session_state["selected_bowler_id"]
+        st.session_state["selected_bowler_id"] = page_df.iloc[0]["bowler_id"]
 
     def _dropdown_index(options, current_value):
         full_options = ["–"] + options
@@ -162,14 +193,32 @@ def bowler_style_tab():
         get_player_style.clear()
         return len(changed)
 
-    def _set_selected_bowler(bid):
-        st.session_state["selected_bowler_id"] = bid
-        st.session_state["pending_selected_bowler_id"] = bid
-        st.session_state.pop("selected_bowler_highlight_id", None)
-        st.session_state.pop("cached_bowler_highlights", None)
-        st.session_state.pop("cached_bowler_highlights_for", None)
+    page_cache_key = (
+        current_page,
+        tuple(selected_grade),
+        style_status,
+        tuple(page_bowler_ids_str),
+    )
 
-    selected_idx = bowler_ids.index(st.session_state["selected_bowler_id"])
+    if st.session_state.get("bowler_highlights_page_key") != page_cache_key:
+        page_highlights = get_highlights_for_bowlers(
+            page_bowler_ids_str,
+            max_per_bowler=MAX_HIGHLIGHTS,
+        )
+
+        if not page_highlights.empty:
+            page_highlights = page_highlights.merge(
+                matches_df[["match_id", "day_1_start", "home_team"]],
+                on="match_id",
+                how="left",
+            )
+            page_highlights["day_1_start"] = pd.to_datetime(page_highlights["day_1_start"])
+
+        st.session_state["bowler_highlights_page_df"] = page_highlights
+        st.session_state["bowler_highlights_page_key"] = page_cache_key
+        st.session_state.pop("selected_bowler_highlight_id", None)
+
+    page_highlights_df = st.session_state.get("bowler_highlights_page_df", pd.DataFrame())
 
     PANEL_HEIGHT = 560
     list_col, highlight_col = st.columns([2, 3])
@@ -178,52 +227,54 @@ def bowler_style_tab():
         nav1, nav2, nav3 = st.columns([1, 1, 2])
 
         with nav1:
-            prev_clicked = st.button(
-                "◀ Prev",
-                disabled=(selected_idx == 0),
+            prev_page_clicked = st.button(
+                "◀ Prev page",
+                disabled=(current_page == 0),
                 use_container_width=True,
-                key="bowler_prev_btn",
+                key="bowler_prev_page_btn",
             )
         with nav2:
-            next_clicked = st.button(
-                "Next ▶",
-                disabled=(selected_idx == len(bowler_ids) - 1),
+            next_page_clicked = st.button(
+                "Next page ▶",
+                disabled=(current_page >= total_pages - 1),
                 use_container_width=True,
-                key="bowler_next_btn",
+                key="bowler_next_page_btn",
             )
         with nav3:
             save_all_clicked = st.button(
-                "💾 Save all changes",
+                "💾 Save page changes",
                 type="primary",
                 use_container_width=True,
                 key="save_all_styles",
             )
 
-        if prev_clicked:
+        if prev_page_clicked:
             try:
-                saved_count = _save_changed_rows(bowler_summary)
+                saved_count = _save_changed_rows(page_df)
                 if saved_count:
                     st.success(f"Saved {saved_count} change(s).")
             except Exception as e:
                 st.error(f"Save failed: {e}")
             else:
-                _set_selected_bowler(bowler_ids[selected_idx - 1])
+                st.session_state["bowler_page_num"] = max(0, current_page - 1)
+                st.session_state["selected_bowler_id"] = None
                 st.rerun()
 
-        if next_clicked:
+        if next_page_clicked:
             try:
-                saved_count = _save_changed_rows(bowler_summary)
+                saved_count = _save_changed_rows(page_df)
                 if saved_count:
                     st.success(f"Saved {saved_count} change(s).")
             except Exception as e:
                 st.error(f"Save failed: {e}")
             else:
-                _set_selected_bowler(bowler_ids[selected_idx + 1])
+                st.session_state["bowler_page_num"] = min(total_pages - 1, current_page + 1)
+                st.session_state["selected_bowler_id"] = None
                 st.rerun()
 
         if save_all_clicked:
             try:
-                saved_count = _save_changed_rows(bowler_summary)
+                saved_count = _save_changed_rows(page_df)
                 if saved_count:
                     st.success(f"Saved {saved_count} change(s).")
                 else:
@@ -234,7 +285,7 @@ def bowler_style_tab():
 
         with st.form("bowler_styles_form", clear_on_submit=False):
             with st.container(height=PANEL_HEIGHT):
-                for _, row in bowler_summary.iterrows():
+                for _, row in page_df.iterrows():
                     bid = row["bowler_id"]
                     is_selected = bid == st.session_state["selected_bowler_id"]
                     selected_marker = " ⟵ current" if is_selected else ""
@@ -274,44 +325,42 @@ def bowler_style_tab():
                             help="Show highlights",
                             use_container_width=True,
                         ):
-                            _set_selected_bowler(bid)
+                            st.session_state["selected_bowler_id"] = bid
+                            st.session_state.pop("selected_bowler_highlight_id", None)
                             st.rerun()
 
                     st.markdown(ROW_DIVIDER, unsafe_allow_html=True)
 
     with highlight_col:
-        selected_row = bowler_summary[
-            bowler_summary["bowler_id"] == st.session_state["selected_bowler_id"]
-        ].iloc[0]
+        selected_row = page_df[
+            page_df["bowler_id"] == st.session_state["selected_bowler_id"]
+        ]
+
+        if selected_row.empty:
+            st.info("Select a bowler to view highlights.")
+            return
+
+        selected_row = selected_row.iloc[0]
         selected_bowler_id_str = str(selected_row["bowler_id"])
 
         st.subheader(f"Highlights — {selected_row['bowler_name']}")
 
-        if st.session_state.get("cached_bowler_highlights_for") != selected_bowler_id_str:
-            highlights_df = get_highlights()
-            bowler_highlights = highlights_df[
-                highlights_df["bowler_id"] == selected_bowler_id_str
-            ].copy()
+        if page_highlights_df.empty:
+            st.info("No highlights available for bowlers on this page.")
+            return
 
-            if not bowler_highlights.empty:
-                bowler_highlights = bowler_highlights.merge(
-                    matches_df[["match_id", "day_1_start", "home_team"]],
-                    on="match_id",
-                    how="left",
-                )
-                bowler_highlights = bowler_highlights.sort_values(
-                    ["day_1_start", "innings_number", "over", "ball_number"],
-                    ascending=[False, True, True, True],
-                ).head(MAX_HIGHLIGHTS).reset_index(drop=True)
-
-            st.session_state["cached_bowler_highlights"] = bowler_highlights
-            st.session_state["cached_bowler_highlights_for"] = selected_bowler_id_str
-
-        bh_sorted = st.session_state["cached_bowler_highlights"]
+        bh_sorted = page_highlights_df[
+            page_highlights_df["bowler_id"] == selected_bowler_id_str
+        ].copy()
 
         if bh_sorted.empty:
             st.info("No highlights available for this bowler.")
             return
+
+        bh_sorted = bh_sorted.sort_values(
+            ["day_1_start", "innings_number", "over", "ball_number"],
+            ascending=[False, True, True, True],
+        ).reset_index(drop=True)
 
         if (
             "selected_bowler_highlight_id" not in st.session_state
@@ -321,7 +370,7 @@ def bowler_style_tab():
 
         st.caption(f"{len(bh_sorted)} highlights shown — tap ▶ to play")
 
-        list_height = 200
+        list_height = 240
         with st.container(height=list_height):
             for _, hrow in bh_sorted.iterrows():
                 hid = hrow["highlight_id"]
