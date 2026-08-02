@@ -6,6 +6,8 @@ from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
 from db import get_batting_innings, get_deliveries_for_batter, get_highlights, get_matches, get_player_style
 from helpers import add_season_column, cascading_multiselect, segment_label, SEGMENT_ORDER, MAROON, MAROON_SHADES
 
+MAX_STREAM_GAP_HOURS = 18
+
 
 def build_timestamped_youtube_url(base_url, seconds):
     """Build a YouTube URL timestamped to `seconds` into the stream, preserving
@@ -25,20 +27,42 @@ def build_timestamped_youtube_url(base_url, seconds):
 
 
 def resolve_ball_video_url(ball_time, day1_url, day1_start, day2_url, day2_start):
-    """Picks day1 or day2 stream based on the ball's calendar date, then builds
-    a timestamped YouTube link. Returns None if no stream is available."""
+    """
+    Picks day1 or day2 stream based on how close the ball's timestamp is to
+    each stream's start time (all values are UTC). A ball is considered to
+    belong to a stream if it falls within MAX_STREAM_GAP_HOURS of that
+    stream's start. Day 1 is checked first; day 2 is only used if day 1
+    doesn't match. If neither stream is within range, falls back to day 1
+    (if a day 1 stream exists at all). Returns None if no stream is usable.
+    """
     if pd.isna(ball_time):
         return None
-    ball_time_ts = pd.to_datetime(ball_time)
+    ball_time_ts = pd.to_datetime(ball_time, utc=True)
 
-    use_day2 = pd.notna(day2_start) and ball_time_ts.date() >= pd.to_datetime(day2_start).date()
-    stream_url = day2_url if use_day2 else day1_url
-    stream_start = day2_start if use_day2 else day1_start
+    max_gap = pd.Timedelta(hours=MAX_STREAM_GAP_HOURS)
 
-    if not stream_url or pd.isna(stream_start):
+    def within_window(stream_start):
+        if pd.isna(stream_start):
+            return False
+        start_ts = pd.to_datetime(stream_start, utc=True)
+        return abs(ball_time_ts - start_ts) <= max_gap
+
+    day1_start_ts = pd.to_datetime(day1_start, utc=True) if pd.notna(day1_start) else None
+    day2_start_ts = pd.to_datetime(day2_start, utc=True) if pd.notna(day2_start) else None
+
+    if day1_url and within_window(day1_start_ts):
+        stream_url, stream_start_ts = day1_url, day1_start_ts
+    elif day2_url and within_window(day2_start_ts):
+        stream_url, stream_start_ts = day2_url, day2_start_ts
+    elif day1_url and day1_start_ts is not None:
+        # Default to day 1 when in doubt, as long as a day 1 stream exists
+        stream_url, stream_start_ts = day1_url, day1_start_ts
+    elif day2_url and day2_start_ts is not None:
+        stream_url, stream_start_ts = day2_url, day2_start_ts
+    else:
         return None
 
-    offset_seconds = (ball_time_ts - pd.to_datetime(stream_start)).total_seconds() - 5
+    offset_seconds = (ball_time_ts - stream_start_ts).total_seconds() - 5
     return build_timestamped_youtube_url(stream_url, offset_seconds)
 
 
@@ -181,8 +205,11 @@ def batting_tab():
         ["player_name", "innings", "total_runs", "average", "strike_rate", "BPD", "fours", "sixes"]
     ].sort_values("total_runs", ascending=False).reset_index(drop=True)
 
-    ROWS_VISIBLE = 10
-    TABLE_HEIGHT = (ROWS_VISIBLE + 1) * 35 + 3
+    # Size the table to the actual number of rows (capped at 10) so a
+    # single-batter selection doesn't leave a block of empty blank rows.
+    MAX_ROWS_VISIBLE = 10
+    rows_to_show = min(len(summary_table), MAX_ROWS_VISIBLE)
+    TABLE_HEIGHT = (rows_to_show + 1) * 35 + 3
 
     summary_event = st.dataframe(
         summary_table,
