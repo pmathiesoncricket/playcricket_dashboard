@@ -198,31 +198,34 @@ def get_highlights_for_bowlers(bowler_ids: tuple[str, ...], max_per_bowler: int 
     if not bowler_ids:
         return pd.DataFrame()
 
-    sql = """
+    params = {"max_per_bowler": max_per_bowler}
+    placeholders = []
+
+    for i, bid in enumerate(bowler_ids):
+        key = f"bid_{i}"
+        placeholders.append(f":{key}")
+        params[key] = bid
+
+    in_sql = ", ".join(placeholders)
+
+    sql = f"""
         WITH ranked AS (
             SELECT
                 h.*,
                 ROW_NUMBER() OVER (
                     PARTITION BY h.bowler_id
-                    ORDER BY m.day_1_start DESC, h.innings_number, h.over, h.ball_number
+                    ORDER BY h.match_id DESC, h.innings_number, h.over, h.ball_number
                 ) AS rn
             FROM highlights h
-            LEFT JOIN matches m ON m.match_id = h.match_id
-            WHERE h.bowler_id = ANY(:bowler_ids)
+            WHERE h.bowler_id IN ({in_sql})
         )
         SELECT *
         FROM ranked
         WHERE rn <= :max_per_bowler
         ORDER BY bowler_id, rn
     """
-    df = conn.query(
-        sql,
-        params={
-            "bowler_ids": list(bowler_ids),
-            "max_per_bowler": max_per_bowler,
-        },
-        ttl=0,
-    )
+
+    df = conn.query(sql, params=params, ttl=0)
     return _stringify_uuids(df)
 
 @st.cache_data(ttl=300)
