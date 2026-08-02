@@ -2,7 +2,7 @@ import streamlit as st
 import pandas as pd
 from sqlalchemy import text
 
-from db import conn, get_matches, get_bowling_deliveries, get_player_style, get_highlights
+from db import conn, get_matches, get_bowler_summary, get_player_style, get_highlights
 
 PACE_SPIN_OPTIONS = ["Pace", "Spin"]
 BOWL_HAND_OPTIONS = ["Right", "Left"]
@@ -20,25 +20,22 @@ def bowler_style_tab():
         "'Save all changes' once to write everything in a single batch."
     )
 
-    deliveries_df = get_bowling_deliveries()
-    if deliveries_df.empty:
+        bowler_summary = get_bowler_summary()
+    if bowler_summary.empty:
         st.info("No delivery data available.")
         return
 
     matches_df = get_matches()
     matches_df["day_1_start"] = pd.to_datetime(matches_df["day_1_start"])
 
-    deliveries_df = deliveries_df.merge(
-        matches_df[["match_id", "grade"]], on="match_id", how="left"
-    )
-
     style_df = get_player_style()
+
+        all_grades = sorted({g for grades in bowler_summary["grades"] for g in (grades or []) if g})
 
     filt_col1, filt_col2 = st.columns([2, 1])
     with filt_col1:
-        grade_options = sorted(deliveries_df["grade"].dropna().unique().tolist())
         selected_grade = st.multiselect(
-            "Grade", grade_options, default=[], key="bowler_filter_grade"
+            "Grade", all_grades, default=[], key="bowler_filter_grade"
         )
     with filt_col2:
         style_status = st.selectbox(
@@ -47,26 +44,19 @@ def bowler_style_tab():
             key="bowler_filter_style_status",
         )
 
-    d_filtered = deliveries_df.copy()
     if selected_grade:
-        d_filtered = d_filtered[d_filtered["grade"].isin(selected_grade)]
+        bowler_summary = bowler_summary[
+            bowler_summary["grades"].apply(
+                lambda g: any(x in selected_grade for x in (g or []))
+            )
+        ]
 
-    d_filtered = d_filtered[d_filtered["bowler_id"].notna()]
-
-    if d_filtered.empty:
+    if bowler_summary.empty:
         st.info("No bowling deliveries match the current filters.")
         return
 
-    bowler_summary = d_filtered.groupby("bowler_id").agg(
-        bowler_name=("bowler", "first"),
-        balls=("bowler_id", "count"),
-    ).reset_index()
-
     bowler_summary = bowler_summary.merge(
         style_df, left_on="bowler_id", right_on="player_id", how="left"
-    )
-    bowler_summary["bowl_style_populated"] = (
-        bowler_summary["bowl_style"].notna() & (bowler_summary["bowl_style"] != "")
     )
 
     if style_status == "Populated":
