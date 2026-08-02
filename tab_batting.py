@@ -1,9 +1,45 @@
 import streamlit as st
 import pandas as pd
 import plotly.express as px
+from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
 
 from db import get_batting_innings, get_deliveries_for_batter, get_highlights, get_matches, get_player_style
 from helpers import add_season_column, cascading_multiselect, segment_label, SEGMENT_ORDER, MAROON, MAROON_SHADES
+
+
+def build_timestamped_youtube_url(base_url, seconds):
+    """Build a YouTube URL timestamped to `seconds` into the stream, preserving
+    existing query params (e.g. si=) and supporting both /watch and /live paths."""
+    if not base_url or pd.isna(seconds):
+        return None
+    try:
+        seconds = max(int(round(seconds)), 0)
+    except (TypeError, ValueError):
+        return None
+
+    parsed = urlparse(base_url)
+    query = parse_qs(parsed.query)
+    query["t"] = [f"{seconds}s"]
+    new_query = urlencode(query, doseq=True)
+    return urlunparse((parsed.scheme, parsed.netloc, parsed.path, "", new_query, ""))
+
+
+def resolve_ball_video_url(ball_time, day1_url, day1_start, day2_url, day2_start):
+    """Picks day1 or day2 stream based on the ball's calendar date, then builds
+    a timestamped YouTube link. Returns None if no stream is available."""
+    if pd.isna(ball_time):
+        return None
+    ball_time_ts = pd.to_datetime(ball_time)
+
+    use_day2 = pd.notna(day2_start) and ball_time_ts.date() >= pd.to_datetime(day2_start).date()
+    stream_url = day2_url if use_day2 else day1_url
+    stream_start = day2_start if use_day2 else day1_start
+
+    if not stream_url or pd.isna(stream_start):
+        return None
+
+    offset_seconds = (ball_time_ts - pd.to_datetime(stream_start)).total_seconds() - 5
+    return build_timestamped_youtube_url(stream_url, offset_seconds)
 
 
 def batting_tab():
@@ -15,6 +51,7 @@ def batting_tab():
         return
 
     batting_df = add_season_column(batting_df, "day_1_start")
+    matches_df = get_matches()
 
     st.sidebar.markdown("### Batting filters")
     st.sidebar.caption("Filters are interdependent \u2014 each one narrows the options below it.")
@@ -315,20 +352,85 @@ def batting_tab():
             axis=1,
         )
 
-        match_display = match_df[
-            ["day_1_start", "match_name", "bat_position", "runs", "balls_faced", "SR", "boundaries"]
+        match_rows = match_df[
+            ["match_id", "innings_id", "day_1_start", "match_name", "bat_position",
+             "runs", "balls_faced", "SR", "boundaries"]
         ].copy()
-        match_display = match_display.sort_values("day_1_start", ascending=False)
-        match_display["day_1_start"] = pd.to_datetime(match_display["day_1_start"]).dt.strftime("%d %b %Y")
-        match_display["SR"] = match_display["SR"].apply(
-            lambda x: f"{x:.0f}" if pd.notna(x) else "\u2013"
-        )
-        match_display = match_display.rename(columns={
-            "day_1_start": "Date", "match_name": "Match", "bat_position": "Pos",
-            "balls_faced": "BF", "boundaries": "Boundaries",
-        })
+        match_rows = match_rows.sort_values("day_1_start", ascending=False).reset_index(drop=True)
 
-        st.dataframe(match_display, width='stretch', hide_index=True)
+        stream_cols = ["match_id", "day1_stream_url", "day1_stream_start", "day2_stream_url", "day2_stream_start"]
+        available_stream_cols = [c for c in stream_cols if c in matches_df.columns]
+        matches_stream_df = (
+            matches_df[available_stream_cols].copy()
+            if available_stream_cols else pd.DataFrame(columns=stream_cols)
+        )
+
+        st.caption(f"{len(match_rows)} innings \u2014 expand a row to see ball-by-ball detail and video links")
+
+        for _, m_row in match_rows.iterrows():
+            date_str = (
+                pd.to_datetime(m_row["day_1_start"]).strftime("%d %b %Y")
+                if pd.notna(m_row["day_1_start"]) else "Unknown date"
+            )
+            sr_str = f"{m_row['SR']:.0f}" if pd.notna(m_row["SR"]) else "\u2013"
+            runs_str = f"{int(m_row['runs'])}" if pd.notna(m_row["runs"]) else "\u2013"
+            bf_str = f"{int(m_row['balls_faced'])}" if pd.notna(m_row["balls_faced"]) else "\u2013"
+            label = (
+                f"{date_str} \u2014 {m_row['match_name']} \u2014 Pos {m_row['bat_position']} \u2014 "
+                f"{runs_str} ({bf_str}) SR {sr_str}"
+            )
+
+            with st.expander(label):
+                if deliveries_df.empty:
+                    st.info("No ball-by-ball data available for this innings.")
+                    continue
+
+                innings_balls = deliveries_df[
+                    (deliveries_df["match_id"] == m_row["match_id"])
+                    & (deliveries_df["innings_id"] == m_row["innings_id"])
+                ].copy()
+
+                if innings_balls.empty:
+                    st.info("No ball-by-ball data available for this innings.")
+                    continue
+
+                innings_balls = innings_balls.sort_values(["over", "ball_number"])
+
+                match_stream_row = matches_stream_df[matches_stream_df["match_id"] == m_row["match_id"]]
+                day1_url = day1_start = day2_url = day2_start = None
+                if not match_stream_row.empty:
+                    srow = match_stream_row.iloc[0]
+                    day1_url = srow.get("day1_stream_url")
+                    day1_start = srow.get("day1_stream_start")
+                    day2_url = srow.get("day2_stream_url")
+                    day2_start = srow.get("day2_stream_start")
+
+                innings_balls["video_url"] = innings_balls["ball_time"].apply(
+                    lambda bt: resolve_ball_video_url(bt, day1_url, day1_start, day2_url, day2_start)
+                )
+                innings_balls["over_ball"] = (
+                    innings_balls["over"].astype("Int64").astype(str) + "."
+                    + innings_balls["ball_number"].astype("Int64").astype(str)
+                )
+
+                ball_display = innings_balls[
+                    ["over_ball", "bowler", "batter_runs", "description", "video_url"]
+                ].rename(columns={
+                    "over_ball": "Over.Ball", "bowler": "Bowler",
+                    "batter_runs": "Runs", "description": "Description", "video_url": "Video",
+                })
+
+                st.dataframe(
+                    ball_display,
+                    hide_index=True,
+                    width='stretch',
+                    column_config={
+                        "Video": st.column_config.LinkColumn("Video", display_text="\u25b6 Watch"),
+                    },
+                )
+
+                if day1_url is None and day2_url is None:
+                    st.caption("No stream found for this match \u2014 video links unavailable.")
 
         st.subheader("Dismissal type distribution \u2014 player vs population")
 
@@ -517,7 +619,6 @@ def batting_tab():
         if highlights_df.empty:
             st.info("No highlights available.")
         else:
-            matches_df = get_matches()
             highlights_df = highlights_df.merge(
                 matches_df[["match_id", "grade", "match_type", "day_1_start"]],
                 on="match_id",
