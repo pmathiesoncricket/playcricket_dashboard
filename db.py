@@ -169,20 +169,25 @@ def get_highlights():
 
 
 @st.cache_data(ttl=300)
-def get_bowling_deliveries():
+def get_bowler_summary():
     """
-    All deliveries at bowler grain — enough columns to count balls bowled
-    per bowler and join to matches for the grade filter. Wides/no-balls are
-    NOT filtered here; this is a raw count of deliveries bowled, not a
-    "balls faced" metric. Uses keyset pagination (id_col="ball_id") since
-    `deliveries` is large enough that offset-based pagination gets slow
-    deep into the table.
+    One row per bowler with total balls bowled and the set of grades they
+    appear in — computed entirely in Postgres via GROUP BY, so only a
+    few hundred rows cross the network instead of every individual delivery.
     """
-    return fetch_all_rows(
-        "deliveries",
-        "ball_id, bowler_id, bowler, match_id",
-        id_col="ball_id",
-    )
+    sql = """
+        SELECT
+            d.bowler_id,
+            MAX(d.bowler) AS bowler_name,
+            COUNT(*) AS balls,
+            array_agg(DISTINCT m.grade) AS grades
+        FROM deliveries d
+        LEFT JOIN matches m ON m.match_id = d.match_id
+        WHERE d.bowler_id IS NOT NULL
+        GROUP BY d.bowler_id
+    """
+    df = conn.query(sql, ttl=0)
+    return _stringify_uuids(df)
 
 
 @st.cache_data(ttl=300)
