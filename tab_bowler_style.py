@@ -270,6 +270,7 @@ def bowler_style_tab():
                     with c_select:
                         if st.form_submit_button(
                             "▶",
+                            key=f"show_hl_{bid}",
                             help="Show highlights",
                             use_container_width=True,
                         ):
