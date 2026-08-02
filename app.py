@@ -2,6 +2,9 @@ import streamlit as st
 import pandas as pd
 import plotly.express as px
 from sqlalchemy import text
+import uuid
+
+
 
 
 # ---------- Setup ----------
@@ -15,6 +18,22 @@ conn = st.connection("postgresql", type="sql")
 
 
 # ---------- Helper functions ----------
+
+def _stringify_uuids(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    psycopg2/SQLAlchemy return PostgreSQL `uuid` columns as native
+    uuid.UUID objects by default. Supabase's PostgREST layer always
+    serialized them as plain strings instead, which the rest of this app's
+    filtering logic (e.g. `batter_id == str(selected_id)`) depends on.
+    This normalizes any uuid.UUID values back to plain strings immediately
+    after fetching, so every downstream comparison keeps working exactly
+    as it did against Supabase.
+    """
+    for col in df.columns:
+        non_null = df[col].dropna()
+        if not non_null.empty and isinstance(non_null.iloc[0], uuid.UUID):
+            df[col] = df[col].apply(lambda x: str(x) if isinstance(x, uuid.UUID) else x)
+    return df
 
 def fetch_all_rows(table_name: str, select_str: str, eq_filters: dict | None = None,
                     order_col: str | None = None, page_size: int = 1000,
@@ -84,7 +103,7 @@ def fetch_all_rows(table_name: str, select_str: str, eq_filters: dict | None = N
 
     if not pages:
         return pd.DataFrame()
-    return pd.concat(pages, ignore_index=True)
+    return _stringify_uuids(pd.concat(pages, ignore_index=True))
 
 
 @st.cache_data(ttl=300)
@@ -153,7 +172,7 @@ def get_deliveries_for_batter(batter_id: str):
 
     if not pages:
         return pd.DataFrame()
-    return pd.concat(pages, ignore_index=True)
+    return _stringify_uuids(pd.concat(pages, ignore_index=True))
 
 
 @st.cache_data(ttl=300)
