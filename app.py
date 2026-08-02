@@ -1,9 +1,9 @@
 import streamlit as st
 
-from tabs.batting import batting_tab
-from tabs.bowling import bowling_tab
-from tabs.bowler_style import bowler_style_tab
-from tabs.team import team_tab
+from tab_batting import batting_tab
+from tab_bowling import bowling_tab
+from tab_bowler_style import bowler_style_tab
+from tab_team import team_tab
 
 
 st.set_page_config(page_title="PlayCricket Dashboard", layout="wide")
