@@ -1,19 +1,14 @@
 import streamlit as st
 import pandas as pd
 import plotly.express as px
-from sqlalchemy import text
 import uuid
-
-
+from sqlalchemy import text
 
 
 # ---------- Setup ----------
 
 st.set_page_config(page_title="PlayCricket Dashboard", layout="wide")
 
-# Reads connection details from .streamlit/secrets.toml under
-# [connections.postgresql] — see the accompanying setup notes for the
-# exact keys required (host, port, database, username, password).
 conn = st.connection("postgresql", type="sql")
 
 
@@ -35,6 +30,7 @@ def _stringify_uuids(df: pd.DataFrame) -> pd.DataFrame:
             df[col] = df[col].apply(lambda x: str(x) if isinstance(x, uuid.UUID) else x)
     return df
 
+
 def fetch_all_rows(table_name: str, select_str: str, eq_filters: dict | None = None,
                     order_col: str | None = None, page_size: int = 1000,
                     id_col: str | None = None) -> pd.DataFrame:
@@ -48,10 +44,6 @@ def fetch_all_rows(table_name: str, select_str: str, eq_filters: dict | None = N
       Required for large tables (e.g. deliveries) — OFFSET has to scan and
       discard every prior row on each page, which gets slower as the offset
       grows. Keyset pagination stays fast regardless of table depth.
-
-    ttl=0 on conn.query() disables st.connection's own query-level cache
-    here, since the outer functions below already apply @st.cache_data at
-    the whole-DataFrame level — matching the original caching behavior.
     """
     pages = []
 
@@ -128,15 +120,12 @@ def get_batting_innings():
     if m_df.empty or pi_df.empty:
         return pd.DataFrame()
 
-    # Join player_style for bowling type / style
     ps_df = fetch_all_rows("player_style", "player_id, pace_spin, bowl_style")
 
     pi_df = pi_df.merge(ps_df, on="player_id", how="left")
 
-    # Merge matches to get grade, match_type, date, and opponent info
     df = pi_df.merge(m_df, on="match_id", how="left")
 
-    # Derive opponent (bowling team) from batting team vs home/away
     df["opponent_team"] = None
     mask_home = df["team"] == df["home_team"]
     df.loc[mask_home, "opponent_team"] = df.loc[mask_home, "away_team"]
@@ -227,22 +216,12 @@ SEGMENT_ORDER = ["1\u201310", "11\u201320", "21\u201330", "31\u201350", "51\u201
 
 
 def sanitize_multiselect_state(key: str, valid_options: list) -> None:
-    """
-    Cascading filters mean an options list can shrink from one rerun to the
-    next. If a widget's stored selection contains values no longer present
-    in its options, Streamlit raises an error on render — so strip any
-    now-invalid values from session_state before the widget is created.
-    """
     if key in st.session_state:
         st.session_state[key] = [v for v in st.session_state[key] if v in valid_options]
 
 
 def cascading_multiselect(container, label: str, options: list, key: str,
                            default_options: list | None = None):
-    """
-    Multiselect for a cascading filter chain. Sanitizes stored state against
-    the current options list, then creates the widget.
-    """
     sanitize_multiselect_state(key, options)
     kwargs = {}
     if key not in st.session_state:
@@ -277,13 +256,11 @@ def batting_tab():
 
     batting_df = add_season_column(batting_df, "day_1_start")
 
-    # Sidebar filters
     st.sidebar.markdown("### Batting filters")
     st.sidebar.caption("Filters are interdependent — each one narrows the options below it.")
 
     stage_df = batting_df.copy()
 
-    # Grade: all present, sorted alphabetically. Default = no filter (nothing selected).
     grade_options = sorted(stage_df["grade"].dropna().unique().tolist())
     selected_grade = cascading_multiselect(
         st.sidebar, "Grade", grade_options, "filter_grade"
@@ -291,7 +268,6 @@ def batting_tab():
     if selected_grade:
         stage_df = stage_df[stage_df["grade"].isin(selected_grade)]
 
-    # Match type: all present given grade selection, sorted alphabetically
     match_type_options = sorted(stage_df["match_type"].dropna().unique().tolist())
     selected_match_type = cascading_multiselect(
         st.sidebar, "Match type", match_type_options, "filter_match_type",
@@ -300,7 +276,6 @@ def batting_tab():
     if selected_match_type:
         stage_df = stage_df[stage_df["match_type"].isin(selected_match_type)]
 
-    # Season: all present given grade/match type selection, sorted descending. Default = no filter.
     season_options = (
         stage_df["season"]
         .dropna()
@@ -314,7 +289,6 @@ def batting_tab():
     if selected_season:
         stage_df = stage_df[stage_df["season"].isin(selected_season)]
 
-    # Bowling type (pace_spin): all present given filters so far
     bowling_type_options = sorted(stage_df["pace_spin"].dropna().unique().tolist())
     selected_bowling_type = cascading_multiselect(
         st.sidebar, "Bowling type (pace/spin)", bowling_type_options, "filter_bowling_type",
@@ -323,7 +297,6 @@ def batting_tab():
     if selected_bowling_type:
         stage_df = stage_df[stage_df["pace_spin"].isin(selected_bowling_type)]
 
-    # Bowling style (bowl_style): separate filter, given filters so far
     bowl_style_options = sorted(stage_df["bowl_style"].dropna().unique().tolist())
     selected_bowl_style = cascading_multiselect(
         st.sidebar, "Bowling style", bowl_style_options, "filter_bowl_style",
@@ -332,7 +305,6 @@ def batting_tab():
     if selected_bowl_style:
         stage_df = stage_df[stage_df["bowl_style"].isin(selected_bowl_style)]
 
-    # Opponent team: all present given filters so far, sorted alphabetically. Default = no filter.
     opponent_options = sorted(stage_df["opponent_team"].dropna().unique().tolist())
     selected_opponent = cascading_multiselect(
         st.sidebar, "Opponent (bowling team)", opponent_options, "filter_opponent"
@@ -340,7 +312,6 @@ def batting_tab():
     if selected_opponent:
         stage_df = stage_df[stage_df["opponent_team"].isin(selected_opponent)]
 
-    # Batter filter (page-wide) — only batters with innings under the filters above
     grouped_all = stage_df.groupby("player_id").agg(
         player_name=("player_name", "first"),
     ).reset_index()
@@ -357,12 +328,8 @@ def batting_tab():
         key="filter_batter",
     )
 
-    # `stage_df` already reflects every filter above (grade, match type, season,
-    # bowling type/style, opponent) — this is also the "population" for
-    # player-vs-population comparisons further down, before the batter filter narrows it.
     population_df = stage_df
 
-    # Apply batter filter on top of the population to get the final working set
     filtered = stage_df.copy()
     selected_batter_id = None
     if selected_batter_name != "All batters":
@@ -374,7 +341,6 @@ def batting_tab():
         st.warning("No batting records match the current filters.")
         return
 
-    # Aggregate per batter (within filters)
     grouped = filtered.groupby("player_id").agg(
         player_name=("player_name", "first"),
         innings=("runs", "count"),
@@ -398,7 +364,6 @@ def batting_tab():
         axis=1,
     )
 
-    # Format: average 2dp, SR & BPD 0dp
     display_df = grouped.copy()
     display_df["average"] = display_df["average"].apply(
         lambda x: f"{x:.2f}" if pd.notna(x) else "\u2013"
@@ -418,7 +383,6 @@ def batting_tab():
         width='stretch',
     )
 
-    # Batter detail metrics (if specific batter selected)
     if selected_batter_id is not None:
         selected_row = grouped[grouped["player_id"] == selected_batter_id].iloc[0]
 
@@ -435,7 +399,6 @@ def batting_tab():
             f"{selected_row['strike_rate']:.0f}" if pd.notna(selected_row["strike_rate"]) else "\u2013",
         )
 
-        # ---------- 10-ball segments from deliveries ----------
         st.subheader("Ball\u2011segment breakdown (deliveries)")
 
         deliveries_df = get_deliveries_for_batter(str(selected_batter_id))
@@ -499,7 +462,6 @@ def batting_tab():
             )
             st.plotly_chart(fig_seg, width='stretch')
 
-        # ---------- Dismissal type distribution — player vs population ----------
         st.subheader("Dismissal type distribution \u2014 player vs population")
 
         pop_innings = population_df
@@ -566,7 +528,6 @@ def batting_tab():
 
             st.dataframe(comp_df, width='stretch')
 
-        # Distribution of innings scores
         st.subheader("Distribution of innings scores (runs)")
         fig_runs = px.histogram(
             filtered,
@@ -576,7 +537,6 @@ def batting_tab():
         )
         st.plotly_chart(fig_runs, width='stretch')
 
-        # Boundary rate vs population (same filters except batter)
         st.subheader("Boundary rate vs population")
 
         pop_boundary_df = population_df
@@ -629,7 +589,6 @@ def batting_tab():
                 else "\u2013",
             )
 
-        # Metrics by batting position
         st.subheader("Metrics by batting position")
 
         pos = filtered.groupby("bat_position").agg(
@@ -680,7 +639,6 @@ def batting_tab():
             width='stretch',
         )
 
-        # Highlights viewer
         st.subheader("Highlights viewer")
 
         highlights_df = get_highlights()
@@ -783,12 +741,18 @@ PACE_SPIN_OPTIONS = ["Pace", "Spin"]
 BOWL_HAND_OPTIONS = ["Right", "Left"]
 BOWL_STYLE_OPTIONS = ["Right Pace", "Left Pace", "LAOS", "Off Spin", "Leg Spin"]
 
+# Compact row separator used in place of st.divider() in this tab, so more
+# rows fit on screen at once without the interface growing/shrinking.
+ROW_DIVIDER = "<hr style='margin:2px 0;border:none;border-top:1px solid #333;'>"
+
 
 def bowler_style_tab():
     st.header("Bowler Style")
     st.caption(
         "Identify bowlers with missing style data, and set pace/spin, "
-        "bowling hand, and bowling style directly against each bowler."
+        "bowling hand, and bowling style directly against each bowler. "
+        "Make changes across as many bowlers as you like, then click "
+        "'Save all changes' once to write everything in a single batch."
     )
 
     deliveries_df = get_bowling_deliveries()
@@ -870,66 +834,92 @@ def bowler_style_tab():
             return full_options.index(current_value)
         return 0
 
+    # Bowler list narrower (2), highlights + video wider (3) — space shifted
+    # to the right-hand panel per your request.
     PANEL_HEIGHT = 560
-    list_col, highlight_col = st.columns([3, 2])
+    list_col, highlight_col = st.columns([2, 3])
 
     with list_col:
+        # Save button sits above the scrollable list so it's always visible
+        # without scrolling, and the interface doesn't shift when clicked.
+        save_clicked = st.button("\U0001F4BE Save all changes", key="save_all_styles", type="primary")
+
         with st.container(height=PANEL_HEIGHT):
             for _, row in bowler_summary.iterrows():
                 bid = row["bowler_id"]
                 st.markdown(f"**{row['bowler_name']}** \u2014 {int(row['balls'])} balls")
 
-                c_ps, c_hand, c_style, c_save, c_select = st.columns([1, 1, 1, 1, 1])
+                c_ps, c_hand, c_style, c_select = st.columns([1, 1, 1, 1])
                 with c_ps:
-                    ps_val = st.selectbox(
+                    st.selectbox(
                         "Pace/Spin", ["\u2013"] + pace_spin_opts,
                         index=_dropdown_index(pace_spin_opts, row.get("pace_spin")),
                         key=f"ps_{bid}", label_visibility="collapsed",
                     )
                 with c_hand:
-                    hand_val = st.selectbox(
+                    st.selectbox(
                         "Hand", ["\u2013"] + bowl_hand_opts,
                         index=_dropdown_index(bowl_hand_opts, row.get("bowl_hand")),
                         key=f"hand_{bid}", label_visibility="collapsed",
                     )
                 with c_style:
-                    style_val = st.selectbox(
+                    st.selectbox(
                         "Style", ["\u2013"] + bowl_style_opts,
                         index=_dropdown_index(bowl_style_opts, row.get("bowl_style")),
                         key=f"style_{bid}", label_visibility="collapsed",
                     )
-                with c_save:
-                    if st.button("\U0001F4BE", key=f"save_{bid}", help="Save style"):
-                        payload = {
-                            "player_id": str(bid),
-                            "pace_spin": None if ps_val == "\u2013" else ps_val,
-                            "bowl_hand": None if hand_val == "\u2013" else hand_val,
-                            "bowl_style": None if style_val == "\u2013" else style_val,
-                        }
-                        try:
-                            with conn.session as s:
-                                s.execute(
-                                    text(
-                                        """
-                                        INSERT INTO player_style (player_id, pace_spin, bowl_hand, bowl_style)
-                                        VALUES (:player_id, :pace_spin, :bowl_hand, :bowl_style)
-                                        ON CONFLICT (player_id) DO UPDATE SET
-                                            pace_spin = EXCLUDED.pace_spin,
-                                            bowl_hand = EXCLUDED.bowl_hand,
-                                            bowl_style = EXCLUDED.bowl_style
-                                        """
-                                    ),
-                                    payload,
-                                )
-                                s.commit()
-                            st.success(f"Saved {row['bowler_name']}")
-                            get_player_style.clear()
-                        except Exception as e:
-                            st.error(f"Save failed: {e}")
                 with c_select:
                     if st.button("\u25b6", key=f"sel_{bid}", help="Show highlights"):
                         st.session_state["selected_bowler_id"] = bid
-                st.divider()
+                st.markdown(ROW_DIVIDER, unsafe_allow_html=True)
+
+        if save_clicked:
+            changed = []
+            for _, row in bowler_summary.iterrows():
+                bid = row["bowler_id"]
+                ps_val = st.session_state.get(f"ps_{bid}", "\u2013")
+                hand_val = st.session_state.get(f"hand_{bid}", "\u2013")
+                style_val = st.session_state.get(f"style_{bid}", "\u2013")
+
+                new_pace_spin = None if ps_val == "\u2013" else ps_val
+                new_bowl_hand = None if hand_val == "\u2013" else hand_val
+                new_bowl_style = None if style_val == "\u2013" else style_val
+
+                orig_pace_spin = row.get("pace_spin") if pd.notna(row.get("pace_spin")) else None
+                orig_bowl_hand = row.get("bowl_hand") if pd.notna(row.get("bowl_hand")) else None
+                orig_bowl_style = row.get("bowl_style") if pd.notna(row.get("bowl_style")) else None
+
+                if (new_pace_spin, new_bowl_hand, new_bowl_style) != (orig_pace_spin, orig_bowl_hand, orig_bowl_style):
+                    changed.append({
+                        "player_id": str(bid),
+                        "pace_spin": new_pace_spin,
+                        "bowl_hand": new_bowl_hand,
+                        "bowl_style": new_bowl_style,
+                    })
+
+            if not changed:
+                st.info("No changes to save.")
+            else:
+                try:
+                    with conn.session as s:
+                        s.execute(
+                            text(
+                                """
+                                INSERT INTO player_style (player_id, pace_spin, bowl_hand, bowl_style)
+                                VALUES (:player_id, :pace_spin, :bowl_hand, :bowl_style)
+                                ON CONFLICT (player_id) DO UPDATE SET
+                                    pace_spin = EXCLUDED.pace_spin,
+                                    bowl_hand = EXCLUDED.bowl_hand,
+                                    bowl_style = EXCLUDED.bowl_style
+                                """
+                            ),
+                            changed,
+                        )
+                        s.commit()
+                    st.success(f"Saved {len(changed)} change(s).")
+                    get_player_style.clear()
+                except Exception as e:
+                    st.error(f"Bulk save failed: {e}")
 
     # ---- Highlights panel for the selected bowler (next to the list, not below it) ----
     with highlight_col:
@@ -947,8 +937,11 @@ def bowler_style_tab():
             st.info("No highlights available for this bowler.")
             return
 
+        # Merge home_team in alongside date so each highlight shows which
+        # ground/fixture it came from — helps identify good vs bad footage
+        # at a glance without opening every clip.
         bowler_highlights = bowler_highlights.merge(
-            matches_df[["match_id", "day_1_start"]], on="match_id", how="left"
+            matches_df[["match_id", "day_1_start", "home_team"]], on="match_id", how="left"
         )
         bh_sorted = bowler_highlights.sort_values(
             ["day_1_start", "innings_number", "over", "ball_number"],
@@ -974,16 +967,17 @@ def bowler_style_tab():
                         if pd.notna(hrow.get("day_1_start"))
                         else ""
                     )
+                    home_team = hrow.get("home_team") or ""
                     st.markdown(
                         f"**{hrow.get('batter', '')}** \u2014 {hrow.get('highlight_type', '')}  \n"
                         f"{hrow.get('description', '')}  \n"
-                        f"<span style='color:gray;font-size:0.8em'>{date_str}</span>",
+                        f"<span style='color:gray;font-size:0.8em'>{date_str} \u00b7 {home_team}</span>",
                         unsafe_allow_html=True,
                     )
                 with btn_col:
                     if st.button("\u25b6", key=f"bowlerhl_play_{hid}"):
                         st.session_state["selected_bowler_highlight_id"] = hid
-                st.divider()
+                st.markdown(ROW_DIVIDER, unsafe_allow_html=True)
 
         sel_h = bh_sorted[
             bh_sorted["highlight_id"] == st.session_state["selected_bowler_highlight_id"]
