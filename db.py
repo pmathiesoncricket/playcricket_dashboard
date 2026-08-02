@@ -100,8 +100,9 @@ def fetch_all_rows(table_name: str, select_str: str, eq_filters: dict | None = N
 def get_matches():
     return fetch_all_rows(
         "matches",
-        "match_id, grade, match_type, day_1_start, home_team_id, home_team, "
-        "away_team_id, away_team, organisation_id, competition_id, competition_name",
+        "match_id, grade, match_type, day_1_start, day_2_start, home_team_id, home_team, "
+        "away_team_id, away_team, organisation_id, competition_id, competition_name, "
+        "day1_stream_url, day1_stream_start, day2_stream_url, day2_stream_start",
         order_col="match_id",
     )
 
