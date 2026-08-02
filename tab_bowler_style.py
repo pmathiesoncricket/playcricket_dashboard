@@ -9,6 +9,7 @@ BOWL_HAND_OPTIONS = ["Right", "Left"]
 BOWL_STYLE_OPTIONS = ["Right Pace", "Left Pace", "LAOS", "Off Spin", "Leg Spin"]
 
 ROW_DIVIDER = "<hr style='margin:2px 0;border:none;border-top:1px solid #333;'>"
+MAX_HIGHLIGHTS = 10
 
 
 def bowler_style_tab():
@@ -88,11 +89,16 @@ def bowler_style_tab():
         set(BOWL_STYLE_OPTIONS) | set(style_df["bowl_style"].dropna().unique().tolist())
     )
 
+    bowler_ids = bowler_summary["bowler_id"].tolist()
+
     if (
         "selected_bowler_id" not in st.session_state
-        or st.session_state["selected_bowler_id"] not in bowler_summary["bowler_id"].values
+        or st.session_state["selected_bowler_id"] not in bowler_ids
     ):
         st.session_state["selected_bowler_id"] = bowler_summary.iloc[0]["bowler_id"]
+
+    if "pending_selected_bowler_id" not in st.session_state:
+        st.session_state["pending_selected_bowler_id"] = st.session_state["selected_bowler_id"]
 
     def _dropdown_index(options, current_value):
         full_options = ["–"] + options
@@ -100,129 +106,211 @@ def bowler_style_tab():
             return full_options.index(current_value)
         return 0
 
+    def _save_changed_rows(df):
+        changed = []
+        for _, row in df.iterrows():
+            bid = row["bowler_id"]
+            ps_val = st.session_state.get(f"ps_{bid}", "–")
+            hand_val = st.session_state.get(f"hand_{bid}", "–")
+            style_val = st.session_state.get(f"style_{bid}", "–")
+
+            new_pace_spin = None if ps_val == "–" else ps_val
+            new_bowl_hand = None if hand_val == "–" else hand_val
+            new_bowl_style = None if style_val == "–" else style_val
+
+            orig_pace_spin = row.get("pace_spin") if pd.notna(row.get("pace_spin")) else None
+            orig_bowl_hand = row.get("bowl_hand") if pd.notna(row.get("bowl_hand")) else None
+            orig_bowl_style = row.get("bowl_style") if pd.notna(row.get("bowl_style")) else None
+
+            if (
+                new_pace_spin,
+                new_bowl_hand,
+                new_bowl_style,
+            ) != (
+                orig_pace_spin,
+                orig_bowl_hand,
+                orig_bowl_style,
+            ):
+                changed.append(
+                    {
+                        "player_id": str(bid),
+                        "pace_spin": new_pace_spin,
+                        "bowl_hand": new_bowl_hand,
+                        "bowl_style": new_bowl_style,
+                    }
+                )
+
+        if not changed:
+            return 0
+
+        with conn.session as s:
+            s.execute(
+                text(
+                    """
+                    INSERT INTO player_style (player_id, pace_spin, bowl_hand, bowl_style)
+                    VALUES (:player_id, :pace_spin, :bowl_hand, :bowl_style)
+                    ON CONFLICT (player_id) DO UPDATE SET
+                        pace_spin = EXCLUDED.pace_spin,
+                        bowl_hand = EXCLUDED.bowl_hand,
+                        bowl_style = EXCLUDED.bowl_style
+                    """
+                ),
+                changed,
+            )
+            s.commit()
+
+        get_player_style.clear()
+        return len(changed)
+
+    def _set_selected_bowler(bid):
+        st.session_state["selected_bowler_id"] = bid
+        st.session_state["pending_selected_bowler_id"] = bid
+        st.session_state.pop("selected_bowler_highlight_id", None)
+        st.session_state.pop("cached_bowler_highlights", None)
+        st.session_state.pop("cached_bowler_highlights_for", None)
+
+    selected_idx = bowler_ids.index(st.session_state["selected_bowler_id"])
+
     PANEL_HEIGHT = 560
     list_col, highlight_col = st.columns([2, 3])
 
     with list_col:
-        save_clicked = st.button("💾 Save all changes", key="save_all_styles", type="primary")
+        nav1, nav2, nav3 = st.columns([1, 1, 2])
 
-        with st.container(height=PANEL_HEIGHT):
-            for _, row in bowler_summary.iterrows():
-                bid = row["bowler_id"]
-                st.markdown(f"**{row['bowler_name']}** — {int(row['balls'])} balls")
+        with nav1:
+            prev_clicked = st.button(
+                "◀ Prev",
+                disabled=(selected_idx == 0),
+                use_container_width=True,
+                key="bowler_prev_btn",
+            )
+        with nav2:
+            next_clicked = st.button(
+                "Next ▶",
+                disabled=(selected_idx == len(bowler_ids) - 1),
+                use_container_width=True,
+                key="bowler_next_btn",
+            )
+        with nav3:
+            save_all_clicked = st.button(
+                "💾 Save all changes",
+                type="primary",
+                use_container_width=True,
+                key="save_all_styles",
+            )
 
-                c_ps, c_hand, c_style, c_select = st.columns([1, 1, 1, 1])
-                with c_ps:
-                    st.selectbox(
-                        "Pace/Spin",
-                        ["–"] + pace_spin_opts,
-                        index=_dropdown_index(pace_spin_opts, row.get("pace_spin")),
-                        key=f"ps_{bid}",
-                        label_visibility="collapsed",
-                    )
-                with c_hand:
-                    st.selectbox(
-                        "Hand",
-                        ["–"] + bowl_hand_opts,
-                        index=_dropdown_index(bowl_hand_opts, row.get("bowl_hand")),
-                        key=f"hand_{bid}",
-                        label_visibility="collapsed",
-                    )
-                with c_style:
-                    st.selectbox(
-                        "Style",
-                        ["–"] + bowl_style_opts,
-                        index=_dropdown_index(bowl_style_opts, row.get("bowl_style")),
-                        key=f"style_{bid}",
-                        label_visibility="collapsed",
-                    )
-                with c_select:
-                    if st.button("▶", key=f"sel_{bid}", help="Show highlights"):
-                        st.session_state["selected_bowler_id"] = bid
-                st.markdown(ROW_DIVIDER, unsafe_allow_html=True)
-
-        if save_clicked:
-            changed = []
-            for _, row in bowler_summary.iterrows():
-                bid = row["bowler_id"]
-                ps_val = st.session_state.get(f"ps_{bid}", "–")
-                hand_val = st.session_state.get(f"hand_{bid}", "–")
-                style_val = st.session_state.get(f"style_{bid}", "–")
-
-                new_pace_spin = None if ps_val == "–" else ps_val
-                new_bowl_hand = None if hand_val == "–" else hand_val
-                new_bowl_style = None if style_val == "–" else style_val
-
-                orig_pace_spin = row.get("pace_spin") if pd.notna(row.get("pace_spin")) else None
-                orig_bowl_hand = row.get("bowl_hand") if pd.notna(row.get("bowl_hand")) else None
-                orig_bowl_style = row.get("bowl_style") if pd.notna(row.get("bowl_style")) else None
-
-                if (
-                    new_pace_spin,
-                    new_bowl_hand,
-                    new_bowl_style,
-                ) != (
-                    orig_pace_spin,
-                    orig_bowl_hand,
-                    orig_bowl_style,
-                ):
-                    changed.append(
-                        {
-                            "player_id": str(bid),
-                            "pace_spin": new_pace_spin,
-                            "bowl_hand": new_bowl_hand,
-                            "bowl_style": new_bowl_style,
-                        }
-                    )
-
-            if not changed:
-                st.info("No changes to save.")
+        if prev_clicked:
+            try:
+                saved_count = _save_changed_rows(bowler_summary)
+                if saved_count:
+                    st.success(f"Saved {saved_count} change(s).")
+            except Exception as e:
+                st.error(f"Save failed: {e}")
             else:
-                try:
-                    with conn.session as s:
-                        s.execute(
-                            text(
-                                """
-                                INSERT INTO player_style (player_id, pace_spin, bowl_hand, bowl_style)
-                                VALUES (:player_id, :pace_spin, :bowl_hand, :bowl_style)
-                                ON CONFLICT (player_id) DO UPDATE SET
-                                    pace_spin = EXCLUDED.pace_spin,
-                                    bowl_hand = EXCLUDED.bowl_hand,
-                                    bowl_style = EXCLUDED.bowl_style
-                                """
-                            ),
-                            changed,
+                _set_selected_bowler(bowler_ids[selected_idx - 1])
+                st.rerun()
+
+        if next_clicked:
+            try:
+                saved_count = _save_changed_rows(bowler_summary)
+                if saved_count:
+                    st.success(f"Saved {saved_count} change(s).")
+            except Exception as e:
+                st.error(f"Save failed: {e}")
+            else:
+                _set_selected_bowler(bowler_ids[selected_idx + 1])
+                st.rerun()
+
+        if save_all_clicked:
+            try:
+                saved_count = _save_changed_rows(bowler_summary)
+                if saved_count:
+                    st.success(f"Saved {saved_count} change(s).")
+                else:
+                    st.info("No changes to save.")
+                st.rerun()
+            except Exception as e:
+                st.error(f"Bulk save failed: {e}")
+
+        with st.form("bowler_styles_form", clear_on_submit=False):
+            with st.container(height=PANEL_HEIGHT):
+                for _, row in bowler_summary.iterrows():
+                    bid = row["bowler_id"]
+                    is_selected = bid == st.session_state["selected_bowler_id"]
+                    selected_marker = " ⟵ current" if is_selected else ""
+                    st.markdown(
+                        f"**{row['bowler_name']}** — {int(row['balls'])} balls{selected_marker}"
+                    )
+
+                    c_ps, c_hand, c_style, c_select = st.columns([1, 1, 1, 1])
+                    with c_ps:
+                        st.selectbox(
+                            "Pace/Spin",
+                            ["–"] + pace_spin_opts,
+                            index=_dropdown_index(pace_spin_opts, row.get("pace_spin")),
+                            key=f"ps_{bid}",
+                            label_visibility="collapsed",
                         )
-                        s.commit()
-                    st.success(f"Saved {len(changed)} change(s).")
-                    get_player_style.clear()
-                except Exception as e:
-                    st.error(f"Bulk save failed: {e}")
+                    with c_hand:
+                        st.selectbox(
+                            "Hand",
+                            ["–"] + bowl_hand_opts,
+                            index=_dropdown_index(bowl_hand_opts, row.get("bowl_hand")),
+                            key=f"hand_{bid}",
+                            label_visibility="collapsed",
+                        )
+                    with c_style:
+                        st.selectbox(
+                            "Style",
+                            ["–"] + bowl_style_opts,
+                            index=_dropdown_index(bowl_style_opts, row.get("bowl_style")),
+                            key=f"style_{bid}",
+                            label_visibility="collapsed",
+                        )
+                    with c_select:
+                        if st.form_submit_button(
+                            "▶",
+                            help="Show highlights",
+                            use_container_width=True,
+                        ):
+                            _set_selected_bowler(bid)
+                            st.rerun()
+
+                    st.markdown(ROW_DIVIDER, unsafe_allow_html=True)
 
     with highlight_col:
         selected_row = bowler_summary[
             bowler_summary["bowler_id"] == st.session_state["selected_bowler_id"]
         ].iloc[0]
+        selected_bowler_id_str = str(selected_row["bowler_id"])
+
         st.subheader(f"Highlights — {selected_row['bowler_name']}")
 
-        highlights_df = get_highlights()
-        bowler_highlights = highlights_df[
-            highlights_df["bowler_id"] == str(selected_row["bowler_id"])
-        ].copy()
+        if st.session_state.get("cached_bowler_highlights_for") != selected_bowler_id_str:
+            highlights_df = get_highlights()
+            bowler_highlights = highlights_df[
+                highlights_df["bowler_id"] == selected_bowler_id_str
+            ].copy()
 
-        if bowler_highlights.empty:
+            if not bowler_highlights.empty:
+                bowler_highlights = bowler_highlights.merge(
+                    matches_df[["match_id", "day_1_start", "home_team"]],
+                    on="match_id",
+                    how="left",
+                )
+                bowler_highlights = bowler_highlights.sort_values(
+                    ["day_1_start", "innings_number", "over", "ball_number"],
+                    ascending=[False, True, True, True],
+                ).head(MAX_HIGHLIGHTS).reset_index(drop=True)
+
+            st.session_state["cached_bowler_highlights"] = bowler_highlights
+            st.session_state["cached_bowler_highlights_for"] = selected_bowler_id_str
+
+        bh_sorted = st.session_state["cached_bowler_highlights"]
+
+        if bh_sorted.empty:
             st.info("No highlights available for this bowler.")
             return
-
-        bowler_highlights = bowler_highlights.merge(
-            matches_df[["match_id", "day_1_start", "home_team"]],
-            on="match_id",
-            how="left",
-        )
-        bh_sorted = bowler_highlights.sort_values(
-            ["day_1_start", "innings_number", "over", "ball_number"],
-            ascending=[False, True, True, True],
-        ).reset_index(drop=True)
 
         if (
             "selected_bowler_highlight_id" not in st.session_state
@@ -230,7 +318,7 @@ def bowler_style_tab():
         ):
             st.session_state["selected_bowler_highlight_id"] = bh_sorted.iloc[0]["highlight_id"]
 
-        st.caption(f"{len(bh_sorted)} highlights — tap ▶ to play")
+        st.caption(f"{len(bh_sorted)} highlights shown — tap ▶ to play")
 
         list_height = 200
         with st.container(height=list_height):
