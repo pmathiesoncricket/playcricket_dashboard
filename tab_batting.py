@@ -405,18 +405,6 @@ def batting_tab():
 
         st.subheader("Match-by-match batting")
 
-        offset_seconds_adjustment = st.number_input(
-            "Video timestamp offset (seconds)",
-            value=-5,
-            step=1,
-            help=(
-                "Fine-tune how far into the stream each ball's video link jumps. "
-                "Negative values start the clip slightly earlier; adjust to match "
-                "your streaming setup's lag."
-            ),
-            key="ball_video_offset_seconds",
-        )
-
         match_df = filtered.copy()
         match_df["boundaries"] = match_df["fours"].fillna(0) + match_df["sixes"].fillna(0)
         match_df["match_name"] = match_df["match_type"].astype(str) + " v " + match_df["opponent_team"].astype(str)
@@ -440,12 +428,19 @@ def batting_tab():
 
         st.caption(f"{len(match_rows)} innings \u2014 expand a row to see ball-by-ball detail and video links")
 
-        # Fixed-width header line so the aligned columns below have labels.
-        header_line = (
-            f"`{_pad('Date', 12)}{_pad('Match', 30)}{_pad('Pos', 6)}"
-            f"{_pad('Score', 12)}{_pad('SR', 6)}`"
+        # Slightly larger, more spaced-out monospace label styling for the
+        # expander headers (header row removed — the values are self-explanatory).
+        st.markdown(
+            """
+            <style>
+            .streamlit-expanderHeader p code, div[data-testid="stExpander"] summary code {
+                font-size: 1.05rem !important;
+                letter-spacing: 0.03em;
+            }
+            </style>
+            """,
+            unsafe_allow_html=True,
         )
-        st.markdown(header_line)
 
         for _, m_row in match_rows.iterrows():
             date_str = (
@@ -459,14 +454,13 @@ def batting_tab():
             score_str = f"{runs_str} ({bf_str})"
             sr_display = f"SR {sr_str}"
 
-            # Each field is padded to a fixed character width with
-            # non-breaking spaces, then the whole line is wrapped in a
-            # markdown code span so it renders in a monospace font —
-            # giving column-like alignment inside an expander label,
-            # which can't otherwise host a real table.
+            # Extra padding width (vs previous version) creates more visual
+            # gap between "columns"; wrapped in a code span for monospace
+            # alignment. No header row — field context is embedded in text
+            # (e.g. "Pos 3", "SR 45").
             label = (
-                f"`{_pad(date_str, 12)}{_pad(m_row['match_name'], 30)}{_pad(pos_str, 6)}"
-                f"{_pad(score_str, 12)}{_pad(sr_display, 6)}`"
+                f"`{_pad(date_str, 16)}{_pad(m_row['match_name'], 36)}{_pad(pos_str, 10)}"
+                f"{_pad(score_str, 16)}{_pad(sr_display, 10)}`"
             )
 
             with st.expander(label):
@@ -501,6 +495,22 @@ def batting_tab():
                     day2_url = srow.get("day2_stream_url")
                     day2_start = srow.get("day2_stream_start")
 
+                # Offset is now set per innings (each stream can have different
+                # lag), keyed on match_id + innings_id so it doesn't clash
+                # with other expanders on the page.
+                offset_key = f"offset_{m_row['match_id']}_{m_row['innings_id']}"
+                offset_seconds_adjustment = st.number_input(
+                    "Video timestamp offset (seconds) for this innings' stream",
+                    value=-5,
+                    step=1,
+                    help=(
+                        "Fine-tune how far into the stream each ball's video link jumps. "
+                        "Negative values start the clip slightly earlier. Different streams "
+                        "can have different lag, so this is set per innings."
+                    ),
+                    key=offset_key,
+                )
+
                 innings_balls["video_url"] = innings_balls["ball_time"].apply(
                     lambda bt: resolve_ball_video_url(
                         bt, day1_url, day1_start, day2_url, day2_start, offset_seconds_adjustment
@@ -510,40 +520,35 @@ def batting_tab():
                     innings_balls["over"].astype("Int64").astype(str) + "."
                     + innings_balls["ball_number"].astype("Int64").astype(str)
                 )
-                innings_balls["video_flag"] = innings_balls["video_url"].apply(
-                    lambda u: "\u25b6 Watch" if u else "\u2013"
-                )
-
-                ball_display = innings_balls[
-                    ["over_ball", "bowler", "bowler_pace_spin", "bowler_bowl_style",
-                     "batter_runs", "description", "video_flag"]
-                ].rename(columns={
-                    "over_ball": "Over.Ball", "bowler": "Bowler",
-                    "bowler_pace_spin": "Type", "bowler_bowl_style": "Bowling style",
-                    "batter_runs": "Runs", "description": "Description", "video_flag": "Video",
-                })
-
-                ball_key = f"balls_{m_row['match_id']}_{m_row['innings_id']}"
-                ball_event = st.dataframe(
-                    ball_display,
-                    hide_index=True,
-                    width='stretch',
-                    on_select="rerun",
-                    selection_mode="single-row",
-                    key=ball_key,
-                )
 
                 if day1_url is None and day2_url is None:
                     st.caption("No stream found for this match \u2014 video links unavailable.")
-                else:
-                    st.caption("Select a row with a video to play it in an overlay.")
 
-                if ball_event.selection.rows:
-                    sel_idx = ball_event.selection.rows[0]
-                    if sel_idx < len(innings_balls):
-                        sel_ball = innings_balls.iloc[sel_idx]
-                        if sel_ball["video_url"]:
-                            _play_video_dialog(sel_ball["video_url"], sel_ball.get("description"))
+                # Header row for the ball-by-ball listing (kept, since this
+                # is a real data table, not the expander label).
+                hcol1, hcol2, hcol3, hcol4, hcol5, hcol6, hcol7 = st.columns([1, 1.4, 1, 1, 0.8, 3.5, 1])
+                hcol1.markdown("**Over.Ball**")
+                hcol2.markdown("**Bowler**")
+                hcol3.markdown("**Type**")
+                hcol4.markdown("**Style**")
+                hcol5.markdown("**Runs**")
+                hcol6.markdown("**Description**")
+                hcol7.markdown("**Video**")
+
+                for b_idx, ball in innings_balls.iterrows():
+                    c1, c2, c3, c4, c5, c6, c7 = st.columns([1, 1.4, 1, 1, 0.8, 3.5, 1])
+                    c1.write(ball["over_ball"])
+                    c2.write(ball.get("bowler", ""))
+                    c3.write(ball.get("bowler_pace_spin", "") or "\u2013")
+                    c4.write(ball.get("bowler_bowl_style", "") or "\u2013")
+                    c5.write(ball.get("batter_runs", ""))
+                    c6.write(ball.get("description", ""))
+                    with c7:
+                        if ball["video_url"]:
+                            if st.button("\u25b6", key=f"watch_{m_row['match_id']}_{m_row['innings_id']}_{b_idx}"):
+                                _play_video_dialog(ball["video_url"], ball.get("description"))
+                        else:
+                            st.write("\u2013")
 
         st.subheader("Dismissal type distribution \u2014 player vs population")
 
