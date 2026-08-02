@@ -82,13 +82,28 @@ def _pad(text, width):
 
 @st.dialog("Watch")
 def _play_video_dialog(url, description):
-    """Renders the selected ball's video in an in-page modal overlay instead
-    of a new browser tab, so users can flip between deliveries without
-    losing their place on the page (especially useful on mobile)."""
+    """Renders the selected ball's video in an in-page modal overlay.
+    Some streams have embedding disabled by the video owner (a YouTube-side
+    setting, not something we can override client-side) — st.video() will
+    show YouTube's "Video unavailable" card in that case. We attempt the
+    embed first, then always provide a fallback "Open on YouTube" link so
+    the video is still reachable even when embedding is blocked."""
     if description:
         st.markdown(f"**{description}**")
-    st.video(url, autoplay=True)
 
+    st.video(url)
+
+    st.markdown(
+        f'<a href="{url}" target="_blank" rel="noopener noreferrer" '
+        f'style="display:inline-block;margin-top:0.5rem;padding:0.4rem 0.9rem;'
+        f'border:1px solid rgba(255,255,255,0.3);border-radius:6px;'
+        f'text-decoration:none;">\u25b6 Open on YouTube</a>',
+        unsafe_allow_html=True,
+    )
+    st.caption(
+        "If the player above shows \u201cVideo unavailable,\u201d the stream owner has "
+        "disabled embedding for this video \u2014 use the link above to watch on YouTube instead."
+    )
 
 def batting_tab():
     st.header("Batting")
