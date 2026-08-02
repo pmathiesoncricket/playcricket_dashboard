@@ -11,6 +11,10 @@ st.set_page_config(page_title="PlayCricket Dashboard", layout="wide")
 
 conn = st.connection("postgresql", type="sql")
 
+# Colour palette centred on maroon, used for every bar/histogram chart.
+MAROON = "#73173F"
+MAROON_SHADES = ["#73173F", "#C97292", "#9E3A5D", "#4A0F29", "#D9A0B5"]
+
 
 # ---------- Helper functions ----------
 
@@ -34,17 +38,6 @@ def _stringify_uuids(df: pd.DataFrame) -> pd.DataFrame:
 def fetch_all_rows(table_name: str, select_str: str, eq_filters: dict | None = None,
                     order_col: str | None = None, page_size: int = 1000,
                     id_col: str | None = None) -> pd.DataFrame:
-    """
-    Fetch ALL rows from a Postgres table, paging manually via raw SQL.
-
-    Two pagination strategies, same as the original Supabase version:
-    - Offset pagination (default): LIMIT/OFFSET. Fine for small/medium tables.
-    - Keyset pagination (pass id_col, e.g. a primary key): "WHERE id_col >
-      last_seen_id ORDER BY id_col LIMIT page_size" instead of OFFSET.
-      Required for large tables (e.g. deliveries) — OFFSET has to scan and
-      discard every prior row on each page, which gets slower as the offset
-      grows. Keyset pagination stays fast regardless of table depth.
-    """
     pages = []
 
     if id_col:
@@ -110,10 +103,6 @@ def get_matches():
 
 @st.cache_data(ttl=300)
 def get_batting_innings():
-    """
-    player_innings for role='batting', joined to matches for grade/match_type/date/opponent,
-    and joined to player_style for bowling type (pace_spin) and bowling style (bowl_style).
-    """
     pi_df = fetch_all_rows("player_innings", "*", eq_filters={"role": "batting"})
 
     m_df = get_matches()
@@ -166,21 +155,11 @@ def get_deliveries_for_batter(batter_id: str):
 
 @st.cache_data(ttl=300)
 def get_highlights():
-    """
-    Highlight clips (fours, sixes, dismissals, etc.) with video URLs.
-    Paginated fetch to avoid pulling an unbounded result set in one query.
-    """
     return fetch_all_rows("highlights", "*")
 
 
 @st.cache_data(ttl=300)
 def get_bowling_deliveries():
-    """
-    Legal deliveries (wides = 0) at bowler grain — just enough columns to
-    count balls bowled per bowler and join to matches for the grade filter.
-    Uses keyset pagination (id_col="ball_id") since `deliveries` is large
-    enough that offset-based pagination gets slow deep into the table.
-    """
     return fetch_all_rows(
         "deliveries",
         "ball_id, bowler_id, bowler, match_id",
@@ -191,14 +170,10 @@ def get_bowling_deliveries():
 
 @st.cache_data(ttl=300)
 def get_player_style():
-    """Full player_style table (batter_hand, pace_spin, bowl_hand, bowl_style)."""
     return fetch_all_rows("player_style", "*")
 
 
 def add_season_column(df: pd.DataFrame, date_col: str = "day_1_start") -> pd.DataFrame:
-    """
-    Add season column with July-June seasons, formatted as 'YYYY/YYYY'.
-    """
     if df.empty or date_col not in df.columns:
         return df
 
@@ -312,23 +287,30 @@ def batting_tab():
     if selected_opponent:
         stage_df = stage_df[stage_df["opponent_team"].isin(selected_opponent)]
 
+    # Batter filter moved here (main panel, above the summary table) instead
+    # of the sidebar — the sidebar stack was tall enough that this dropdown's
+    # menu rendered partially off-screen with nowhere to open. This also
+    # co-locates it with the new "click a row to filter" behaviour below.
     grouped_all = stage_df.groupby("player_id").agg(
         player_name=("player_name", "first"),
     ).reset_index()
-
     batter_options = sorted(grouped_all["player_name"].dropna().tolist())
     if "filter_batter" in st.session_state and st.session_state["filter_batter"] not in (
         ["All batters"] + batter_options
     ):
         st.session_state["filter_batter"] = "All batters"
-    selected_batter_name = st.sidebar.selectbox(
-        "Batter (applies to whole page)",
+
+    # Snapshot before the batter filter narrows things further — used for
+    # player-vs-population comparisons later in this function.
+    population_df = stage_df
+
+    st.subheader("Batting summary (filtered)")
+    selected_batter_name = st.selectbox(
+        "Batter (applies to whole page) \u2014 or click a row below",
         options=["All batters"] + batter_options,
         index=0,
         key="filter_batter",
     )
-
-    population_df = stage_df
 
     filtered = stage_df.copy()
     selected_batter_id = None
@@ -375,13 +357,29 @@ def batting_tab():
         lambda x: f"{x:.0f}" if pd.notna(x) else "\u2013"
     )
 
-    st.subheader("Batting summary (filtered)")
-    st.dataframe(
-        display_df[
-            ["player_name", "innings", "total_runs", "average", "strike_rate", "BPD", "fours", "sixes"]
-        ].sort_values("player_name"),
+    summary_table = display_df[
+        ["player_name", "innings", "total_runs", "average", "strike_rate", "BPD", "fours", "sixes"]
+    ].sort_values("total_runs", ascending=False).reset_index(drop=True)
+
+    ROWS_VISIBLE = 10
+    TABLE_HEIGHT = (ROWS_VISIBLE + 1) * 35 + 3
+
+    summary_event = st.dataframe(
+        summary_table,
         width='stretch',
+        height=TABLE_HEIGHT,
+        hide_index=True,
+        on_select="rerun",
+        selection_mode="single-row",
+        key="batting_summary_table",
     )
+
+    if summary_event.selection.rows:
+        clicked_idx = summary_event.selection.rows[0]
+        clicked_name = summary_table.iloc[clicked_idx]["player_name"]
+        if st.session_state.get("filter_batter") != clicked_name:
+            st.session_state["filter_batter"] = clicked_name
+            st.rerun()
 
     if selected_batter_id is not None:
         selected_row = grouped[grouped["player_id"] == selected_batter_id].iloc[0]
@@ -409,21 +407,22 @@ def batting_tab():
             deliveries_df["wides"] = deliveries_df["wides"].fillna(0)
             deliveries_df["legal_ball"] = deliveries_df["wides"] == 0
 
-            deliveries_df["ball_index"] = (
-                deliveries_df.groupby("innings_id")["legal_ball"]
+            seg_df = deliveries_df.copy()
+            seg_df["ball_index"] = (
+                seg_df.groupby("innings_id")["legal_ball"]
                 .cumsum()
-                .where(deliveries_df["legal_ball"], None)
+                .where(seg_df["legal_ball"], None)
             )
 
-            deliveries_df = deliveries_df[deliveries_df["ball_index"].notna()]
-            deliveries_df["ball_index"] = deliveries_df["ball_index"].astype(int)
-            deliveries_df["segment"] = pd.Categorical(
-                deliveries_df["ball_index"].map(segment_label),
+            seg_df = seg_df[seg_df["ball_index"].notna()]
+            seg_df["ball_index"] = seg_df["ball_index"].astype(int)
+            seg_df["segment"] = pd.Categorical(
+                seg_df["ball_index"].map(segment_label),
                 categories=SEGMENT_ORDER,
                 ordered=True,
             )
 
-            seg = deliveries_df.groupby("segment", observed=True).agg(
+            seg = seg_df.groupby("segment", observed=True).agg(
                 balls=("ball_index", "count"),
                 runs=("batter_runs", "sum"),
                 dismissals=("dismissal_type", lambda x: x.notna().sum()),
@@ -459,8 +458,92 @@ def batting_tab():
                 y="strike_rate",
                 category_orders={"segment": SEGMENT_ORDER},
                 title=f"Strike rate by ball segment for {selected_row['player_name']}",
+                color_discrete_sequence=[MAROON],
             )
             st.plotly_chart(fig_seg, width='stretch')
+
+            # ---------- Batting vs bowling style (deliveries) ----------
+            st.subheader("Batting vs bowling style (deliveries)")
+
+            style_lookup = get_player_style()[["player_id", "bowl_style"]].rename(
+                columns={"player_id": "bowler_id"}
+            )
+            style_deliveries = deliveries_df.merge(style_lookup, on="bowler_id", how="left")
+            style_deliveries["bowl_style"] = style_deliveries["bowl_style"].fillna("Unknown")
+
+            legal = style_deliveries[style_deliveries["wides"] == 0].copy()
+            by_style = legal.groupby("bowl_style").agg(
+                runs=("batter_runs", "sum"),
+                balls=("bowler_id", "count"),
+                dismissals=("dismissal_type", lambda x: x.notna().sum()),
+                fours=("description", lambda x: x.str.contains("FOUR", case=False, na=False).sum()),
+                sixes=("description", lambda x: x.str.contains("SIX", case=False, na=False).sum()),
+            ).reset_index()
+
+            by_style["average"] = by_style.apply(
+                lambda r: r["runs"] / r["dismissals"] if r["dismissals"] > 0 else None, axis=1
+            )
+            by_style["strike_rate"] = by_style.apply(
+                lambda r: 100 * r["runs"] / r["balls"] if r["balls"] > 0 else None, axis=1
+            )
+            by_style["BPD"] = by_style.apply(
+                lambda r: r["balls"] / r["dismissals"] if r["dismissals"] > 0 else None, axis=1
+            )
+            by_style["boundaries"] = by_style["fours"] + by_style["sixes"]
+            by_style["boundary_rate"] = by_style.apply(
+                lambda r: r["balls"] / r["boundaries"] if r["boundaries"] > 0 else None, axis=1
+            )
+
+            by_style_display = by_style.copy()
+            by_style_display["average"] = by_style_display["average"].apply(
+                lambda x: f"{x:.2f}" if pd.notna(x) else "\u2013"
+            )
+            by_style_display["strike_rate"] = by_style_display["strike_rate"].apply(
+                lambda x: f"{x:.0f}" if pd.notna(x) else "\u2013"
+            )
+            by_style_display["BPD"] = by_style_display["BPD"].apply(
+                lambda x: f"{x:.0f}" if pd.notna(x) else "\u2013"
+            )
+            by_style_display["boundary_rate"] = by_style_display["boundary_rate"].apply(
+                lambda x: f"{x:.1f}" if pd.notna(x) else "\u2013"
+            )
+
+            st.dataframe(
+                by_style_display[
+                    ["bowl_style", "runs", "balls", "average", "strike_rate", "BPD", "boundary_rate"]
+                ].rename(columns={
+                    "bowl_style": "Bowling style", "balls": "BF",
+                    "strike_rate": "SR", "boundary_rate": "Balls/Boundary",
+                }).sort_values("runs", ascending=False),
+                width='stretch',
+                hide_index=True,
+            )
+
+        # ---------- Match-by-match batting ----------
+        st.subheader("Match-by-match batting")
+
+        match_df = filtered.copy()
+        match_df["boundaries"] = match_df["fours"].fillna(0) + match_df["sixes"].fillna(0)
+        match_df["match_name"] = match_df["match_type"].astype(str) + " v " + match_df["opponent_team"].astype(str)
+        match_df["SR"] = match_df.apply(
+            lambda r: 100 * r["runs"] / r["balls_faced"] if r["balls_faced"] and r["balls_faced"] > 0 else None,
+            axis=1,
+        )
+
+        match_display = match_df[
+            ["day_1_start", "match_name", "bat_position", "runs", "balls_faced", "SR", "boundaries"]
+        ].copy()
+        match_display = match_display.sort_values("day_1_start", ascending=False)
+        match_display["day_1_start"] = pd.to_datetime(match_display["day_1_start"]).dt.strftime("%d %b %Y")
+        match_display["SR"] = match_display["SR"].apply(
+            lambda x: f"{x:.0f}" if pd.notna(x) else "\u2013"
+        )
+        match_display = match_display.rename(columns={
+            "day_1_start": "Date", "match_name": "Match", "bat_position": "Pos",
+            "balls_faced": "BF", "boundaries": "Boundaries",
+        })
+
+        st.dataframe(match_display, width='stretch', hide_index=True)
 
         st.subheader("Dismissal type distribution \u2014 player vs population")
 
@@ -523,6 +606,7 @@ def batting_tab():
                 color="group",
                 barmode="group",
                 title="Dismissal type % \u2014 player vs population",
+                color_discrete_sequence=MAROON_SHADES[:2],
             )
             st.plotly_chart(fig_comp, width='stretch')
 
@@ -534,7 +618,10 @@ def batting_tab():
             x="runs",
             nbins=20,
             title="Distribution of individual innings runs",
+            color_discrete_sequence=[MAROON],
+            text_auto=True,
         )
+        fig_runs.update_layout(bargap=0.15)
         st.plotly_chart(fig_runs, width='stretch')
 
         st.subheader("Boundary rate vs population")
@@ -741,8 +828,6 @@ PACE_SPIN_OPTIONS = ["Pace", "Spin"]
 BOWL_HAND_OPTIONS = ["Right", "Left"]
 BOWL_STYLE_OPTIONS = ["Right Pace", "Left Pace", "LAOS", "Off Spin", "Leg Spin"]
 
-# Compact row separator used in place of st.divider() in this tab, so more
-# rows fit on screen at once without the interface growing/shrinking.
 ROW_DIVIDER = "<hr style='margin:2px 0;border:none;border-top:1px solid #333;'>"
 
 
@@ -769,7 +854,6 @@ def bowler_style_tab():
 
     style_df = get_player_style()
 
-    # ---- Filters ----
     filt_col1, filt_col2 = st.columns([2, 1])
     with filt_col1:
         grade_options = sorted(deliveries_df["grade"].dropna().unique().tolist())
@@ -834,14 +918,10 @@ def bowler_style_tab():
             return full_options.index(current_value)
         return 0
 
-    # Bowler list narrower (2), highlights + video wider (3) — space shifted
-    # to the right-hand panel per your request.
     PANEL_HEIGHT = 560
     list_col, highlight_col = st.columns([2, 3])
 
     with list_col:
-        # Save button sits above the scrollable list so it's always visible
-        # without scrolling, and the interface doesn't shift when clicked.
         save_clicked = st.button("\U0001F4BE Save all changes", key="save_all_styles", type="primary")
 
         with st.container(height=PANEL_HEIGHT):
@@ -921,7 +1001,6 @@ def bowler_style_tab():
                 except Exception as e:
                     st.error(f"Bulk save failed: {e}")
 
-    # ---- Highlights panel for the selected bowler (next to the list, not below it) ----
     with highlight_col:
         selected_row = bowler_summary[
             bowler_summary["bowler_id"] == st.session_state["selected_bowler_id"]
@@ -937,9 +1016,6 @@ def bowler_style_tab():
             st.info("No highlights available for this bowler.")
             return
 
-        # Merge home_team in alongside date so each highlight shows which
-        # ground/fixture it came from — helps identify good vs bad footage
-        # at a glance without opening every clip.
         bowler_highlights = bowler_highlights.merge(
             matches_df[["match_id", "day_1_start", "home_team"]], on="match_id", how="left"
         )
