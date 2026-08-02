@@ -80,31 +80,6 @@ def _pad(text, width):
     return text + NBSP * (width - len(text))
 
 
-@st.dialog("Watch")
-def _play_video_dialog(url, description):
-    """Renders the selected ball's video in an in-page modal overlay.
-    Some streams have embedding disabled by the video owner (a YouTube-side
-    setting, not something we can override client-side) — st.video() will
-    show YouTube's "Video unavailable" card in that case. We attempt the
-    embed first, then always provide a fallback "Open on YouTube" link so
-    the video is still reachable even when embedding is blocked."""
-    if description:
-        st.markdown(f"**{description}**")
-
-    st.video(url)
-
-    st.markdown(
-        f'<a href="{url}" target="_blank" rel="noopener noreferrer" '
-        f'style="display:inline-block;margin-top:0.5rem;padding:0.4rem 0.9rem;'
-        f'border:1px solid rgba(255,255,255,0.3);border-radius:6px;'
-        f'text-decoration:none;">\u25b6 Open on YouTube</a>',
-        unsafe_allow_html=True,
-    )
-    st.caption(
-        "If the player above shows \u201cVideo unavailable,\u201d the stream owner has "
-        "disabled embedding for this video \u2014 use the link above to watch on YouTube instead."
-    )
-
 def batting_tab():
     st.header("Batting")
 
@@ -469,10 +444,6 @@ def batting_tab():
             score_str = f"{runs_str} ({bf_str})"
             sr_display = f"SR {sr_str}"
 
-            # Extra padding width (vs previous version) creates more visual
-            # gap between "columns"; wrapped in a code span for monospace
-            # alignment. No header row — field context is embedded in text
-            # (e.g. "Pos 3", "SR 45").
             label = (
                 f"`{_pad(date_str, 16)}{_pad(m_row['match_name'], 36)}{_pad(pos_str, 10)}"
                 f"{_pad(score_str, 16)}{_pad(sr_display, 10)}`"
@@ -510,7 +481,7 @@ def batting_tab():
                     day2_url = srow.get("day2_stream_url")
                     day2_start = srow.get("day2_stream_start")
 
-                # Offset is now set per innings (each stream can have different
+                # Offset is set per innings (each stream can have different
                 # lag), keyed on match_id + innings_id so it doesn't clash
                 # with other expanders on the page.
                 offset_key = f"offset_{m_row['match_id']}_{m_row['innings_id']}"
@@ -539,31 +510,23 @@ def batting_tab():
                 if day1_url is None and day2_url is None:
                     st.caption("No stream found for this match \u2014 video links unavailable.")
 
-                # Header row for the ball-by-ball listing (kept, since this
-                # is a real data table, not the expander label).
-                hcol1, hcol2, hcol3, hcol4, hcol5, hcol6, hcol7 = st.columns([1, 1.4, 1, 1, 0.8, 3.5, 1])
-                hcol1.markdown("**Over.Ball**")
-                hcol2.markdown("**Bowler**")
-                hcol3.markdown("**Type**")
-                hcol4.markdown("**Style**")
-                hcol5.markdown("**Runs**")
-                hcol6.markdown("**Description**")
-                hcol7.markdown("**Video**")
+                ball_display = innings_balls[
+                    ["over_ball", "bowler", "bowler_pace_spin", "bowler_bowl_style",
+                     "batter_runs", "description", "video_url"]
+                ].rename(columns={
+                    "over_ball": "Over.Ball", "bowler": "Bowler",
+                    "bowler_pace_spin": "Type", "bowler_bowl_style": "Style",
+                    "batter_runs": "Runs", "description": "Description", "video_url": "Video",
+                })
 
-                for b_idx, ball in innings_balls.iterrows():
-                    c1, c2, c3, c4, c5, c6, c7 = st.columns([1, 1.4, 1, 1, 0.8, 3.5, 1])
-                    c1.write(ball["over_ball"])
-                    c2.write(ball.get("bowler", ""))
-                    c3.write(ball.get("bowler_pace_spin", "") or "\u2013")
-                    c4.write(ball.get("bowler_bowl_style", "") or "\u2013")
-                    c5.write(ball.get("batter_runs", ""))
-                    c6.write(ball.get("description", ""))
-                    with c7:
-                        if ball["video_url"]:
-                            if st.button("\u25b6", key=f"watch_{m_row['match_id']}_{m_row['innings_id']}_{b_idx}"):
-                                _play_video_dialog(ball["video_url"], ball.get("description"))
-                        else:
-                            st.write("\u2013")
+                st.dataframe(
+                    ball_display,
+                    hide_index=True,
+                    width='stretch',
+                    column_config={
+                        "Video": st.column_config.LinkColumn("Video", display_text="\u25b6 Watch"),
+                    },
+                )
 
         st.subheader("Dismissal type distribution \u2014 player vs population")
 
