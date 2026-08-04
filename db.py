@@ -10,6 +10,44 @@ conn = st.connection("postgresql", type="sql")
 
 # ---------- Internal helpers ----------
 
+@st.cache_data(ttl=300)
+def get_deliveries_for_batters(batter_ids: tuple[str, ...]):
+    """Fetch all deliveries for a set of batters (used for season-level report)."""
+    if not batter_ids:
+        return pd.DataFrame()
+
+    pages = []
+    start = 0
+    page_size = 5000
+    params = {}
+    placeholders = []
+    for i, bid in enumerate(batter_ids):
+        key = f"bid_{i}"
+        placeholders.append(f":{key}")
+        params[key] = bid
+    in_sql = ", ".join(placeholders)
+
+    while True:
+        params["limit"] = page_size
+        params["offset"] = start
+        sql = f"""
+            SELECT * FROM deliveries
+            WHERE batter_id IN ({in_sql})
+            ORDER BY match_id, innings_id, over, ball_number
+            LIMIT :limit OFFSET :offset
+        """
+        df_page = conn.query(sql, params=params, ttl=0)
+        if df_page.empty:
+            break
+        pages.append(df_page)
+        if len(df_page) < page_size:
+            break
+        start += page_size
+
+    if not pages:
+        return pd.DataFrame()
+    return _stringify_uuids(pd.concat(pages, ignore_index=True))
+
 def _stringify_uuids(df: pd.DataFrame) -> pd.DataFrame:
     """
     psycopg2/SQLAlchemy return PostgreSQL `uuid` columns as native
