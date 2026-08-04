@@ -343,6 +343,12 @@ def get_bowling_conceded_summary():
     innings_id) keys as the filtered player_innings rows -- rather than
     always reflecting a bowler's whole career regardless of filters.
 
+    Fours/sixes are identified by batter_runs = 4 / 6 (i.e. runs actually
+    scored off the bat on that delivery) -- NOT by parsing the free-text
+    `description` column, which doesn't reliably contain the words
+    "FOUR"/"SIX" and was previously causing every boundary-rate figure on
+    the Bowling tab to read as zero.
+
     runs conceded uses deliveries.bowler_runs where populated (the ball's
     true bowler-attributed runs, including wide/no-ball penalty runs but
     excluding byes/leg-byes), falling back to batter_runs + wides + no_balls
@@ -355,8 +361,8 @@ def get_bowling_conceded_summary():
             innings_id,
             COUNT(*) FILTER (WHERE wides = 0 AND no_balls = 0) AS legal_balls,
             SUM(COALESCE(bowler_runs, batter_runs + wides + no_balls)) AS runs_conceded,
-            COUNT(*) FILTER (WHERE description ILIKE '%FOUR%') AS fours,
-            COUNT(*) FILTER (WHERE description ILIKE '%SIX%') AS sixes
+            COUNT(*) FILTER (WHERE batter_runs = 4) AS fours,
+            COUNT(*) FILTER (WHERE batter_runs = 6) AS sixes
         FROM deliveries
         WHERE bowler_id IS NOT NULL
         GROUP BY bowler_id, match_id, innings_id
