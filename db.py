@@ -1,52 +1,39 @@
+
 import streamlit as st
 import pandas as pd
 import uuid
-
+import time
+from sqlalchemy.exc import OperationalError, TimeoutError as SATimeoutError
 
 # ---------- Setup ----------
 
 conn = st.connection("postgresql", type="sql")
 
+# Retry/backoff specifically for connection-pool exhaustion. This happens
+# when many @st.cache_data functions miss at once (e.g. right after a
+# deploy or a "Clear caches") and all race for a DB connection from a
+# small SQLAlchemy pool. A short wait usually frees up a connection as
+# other queries finish, so we retry a few times with increasing delay
+# before giving up and raising.
+MAX_QUERY_ATTEMPTS = 4
+RETRY_BASE_DELAY_SECONDS = 1.5
+
+
+def _query_with_retry(sql, params=None, ttl=0):
+    last_exc = None
+    for attempt in range(1, MAX_QUERY_ATTEMPTS + 1):
+        try:
+            return conn.query(sql, params=params, ttl=ttl)
+        except (OperationalError, SATimeoutError) as exc:
+            last_exc = exc
+            if attempt < MAX_QUERY_ATTEMPTS:
+                time.sleep(RETRY_BASE_DELAY_SECONDS * attempt)
+            else:
+                raise
+    raise last_exc
+
 
 # ---------- Internal helpers ----------
-
-@st.cache_data(ttl=300)
-def get_deliveries_for_batters(batter_ids: tuple[str, ...]):
-    """Fetch all deliveries for a set of batters (used for season-level report)."""
-    if not batter_ids:
-        return pd.DataFrame()
-
-    pages = []
-    start = 0
-    page_size = 5000
-    params = {}
-    placeholders = []
-    for i, bid in enumerate(batter_ids):
-        key = f"bid_{i}"
-        placeholders.append(f":{key}")
-        params[key] = bid
-    in_sql = ", ".join(placeholders)
-
-    while True:
-        params["limit"] = page_size
-        params["offset"] = start
-        sql = f"""
-            SELECT * FROM deliveries
-            WHERE batter_id IN ({in_sql})
-            ORDER BY match_id, innings_id, over, ball_number
-            LIMIT :limit OFFSET :offset
-        """
-        df_page = conn.query(sql, params=params, ttl=0)
-        if df_page.empty:
-            break
-        pages.append(df_page)
-        if len(df_page) < page_size:
-            break
-        start += page_size
-
-    if not pages:
-        return pd.DataFrame()
-    return _stringify_uuids(pd.concat(pages, ignore_index=True))
 
 def _stringify_uuids(df: pd.DataFrame) -> pd.DataFrame:
     """
@@ -75,7 +62,7 @@ def fetch_all_rows(table_name: str, select_str: str, eq_filters: dict | None = N
     - Offset pagination (default): LIMIT/OFFSET. Fine for small/medium tables.
     - Keyset pagination (pass id_col, e.g. a primary key): "WHERE id_col >
       last_seen_id ORDER BY id_col LIMIT page_size" instead of OFFSET.
-      Required for large tables (e.g. deliveries) — OFFSET has to scan and
+      Required for large tables (e.g. deliveries) -- OFFSET has to scan and
       discard every prior row on each page, which gets slower as the offset
       grows. Keyset pagination stays fast regardless of table depth.
     """
@@ -97,7 +84,7 @@ def fetch_all_rows(table_name: str, select_str: str, eq_filters: dict | None = N
             params["page_size"] = page_size
             sql = f"SELECT {select_str} FROM {table_name} {where_sql} ORDER BY {id_col} LIMIT :page_size"
 
-            df_page = conn.query(sql, params=params, ttl=0)
+            df_page = _query_with_retry(sql, params=params, ttl=0)
             if df_page.empty:
                 break
             pages.append(df_page)
@@ -119,7 +106,7 @@ def fetch_all_rows(table_name: str, select_str: str, eq_filters: dict | None = N
             params["offset"] = start
             sql = f"SELECT {select_str} FROM {table_name} {where_sql} {order_sql} LIMIT :limit OFFSET :offset"
 
-            df_page = conn.query(sql, params=params, ttl=0)
+            df_page = _query_with_retry(sql, params=params, ttl=0)
             if df_page.empty:
                 break
             pages.append(df_page)
@@ -184,11 +171,52 @@ def get_deliveries_for_batter(batter_id: str):
             ORDER BY innings_id, over, ball_number
             LIMIT :limit OFFSET :offset
         """
-        df_page = conn.query(
+        df_page = _query_with_retry(
             sql,
             params={"batter_id": batter_id, "limit": page_size, "offset": start},
             ttl=0,
         )
+        if df_page.empty:
+            break
+        pages.append(df_page)
+        if len(df_page) < page_size:
+            break
+        start += page_size
+
+    if not pages:
+        return pd.DataFrame()
+    return _stringify_uuids(pd.concat(pages, ignore_index=True))
+
+
+@st.cache_data(ttl=300)
+def get_deliveries_for_batters(batter_ids: tuple[str, ...]):
+    """Bulk fetch of deliveries for a set of batters (used by the season
+    report, which needs many batters' deliveries in one shot rather than
+    one connection per batter)."""
+    if not batter_ids:
+        return pd.DataFrame()
+
+    pages = []
+    start = 0
+    page_size = 5000
+    params = {}
+    placeholders = []
+    for i, bid in enumerate(batter_ids):
+        key = f"bid_{i}"
+        placeholders.append(f":{key}")
+        params[key] = bid
+    in_sql = ", ".join(placeholders)
+
+    while True:
+        params["limit"] = page_size
+        params["offset"] = start
+        sql = f"""
+            SELECT * FROM deliveries
+            WHERE batter_id IN ({in_sql})
+            ORDER BY match_id, innings_id, over, ball_number
+            LIMIT :limit OFFSET :offset
+        """
+        df_page = _query_with_retry(sql, params=params, ttl=0)
         if df_page.empty:
             break
         pages.append(df_page)
@@ -211,7 +239,7 @@ def get_highlights():
 def get_bowler_summary():
     """
     One row per bowler with total balls bowled and the set of grades they
-    appear in — computed entirely in Postgres via GROUP BY, so only a
+    appear in -- computed entirely in Postgres via GROUP BY, so only a
     few hundred rows cross the network instead of every individual delivery.
     """
     sql = """
@@ -225,8 +253,9 @@ def get_bowler_summary():
         WHERE d.bowler_id IS NOT NULL
         GROUP BY d.bowler_id
     """
-    df = conn.query(sql, ttl=0)
+    df = _query_with_retry(sql, ttl=0)
     return _stringify_uuids(df)
+
 
 @st.cache_data(ttl=300)
 def get_highlights_for_bowlers(bowler_ids: tuple[str, ...], max_per_bowler: int = 10):
@@ -264,8 +293,9 @@ def get_highlights_for_bowlers(bowler_ids: tuple[str, ...], max_per_bowler: int 
         ORDER BY bowler_id, rn
     """
 
-    df = conn.query(sql, params=params, ttl=0)
+    df = _query_with_retry(sql, params=params, ttl=0)
     return _stringify_uuids(df)
+
 
 @st.cache_data(ttl=300)
 def get_player_style():
