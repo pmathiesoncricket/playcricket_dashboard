@@ -1,4 +1,3 @@
-
 import streamlit as st
 import pandas as pd
 import uuid
@@ -159,6 +158,43 @@ def get_batting_innings():
 
 
 @st.cache_data(ttl=300)
+def get_bowling_innings():
+    """
+    player_innings for role='bowling', joined to matches for grade/match_type/date/opponent,
+    and joined to player_style for the BOWLER'S OWN batting hand / pace_spin / bowl_style.
+
+    This mirrors get_batting_innings() exactly, including the same
+    self-referential player_style join (on this row's own player_id) that
+    powers the Batting tab's "Bowling type"/"Bowling style" sidebar filters.
+    Here it powers "Bowling type", "Bowling style" AND the new "Batter hand
+    (bowler's own)" filter -- all three describe the bowler themselves, not
+    whoever they were bowling to on a given ball. The hand of the batter
+    actually FACED (a ball-by-ball concept) is handled separately in
+    tab_bowling.py by joining player_style a second time onto deliveries via
+    batter_id -- i.e. the same player_style table joined twice, under two
+    different aliases, for two different purposes.
+    """
+    pi_df = fetch_all_rows("player_innings", "*", eq_filters={"role": "bowling"})
+
+    m_df = get_matches()
+    if m_df.empty or pi_df.empty:
+        return pd.DataFrame()
+
+    ps_df = fetch_all_rows("player_style", "player_id, batter_hand, pace_spin, bowl_style")
+
+    pi_df = pi_df.merge(ps_df, on="player_id", how="left")
+
+    df = pi_df.merge(m_df, on="match_id", how="left")
+
+    df["opponent_team"] = None
+    mask_home = df["team"] == df["home_team"]
+    df.loc[mask_home, "opponent_team"] = df.loc[mask_home, "away_team"]
+    df.loc[~mask_home, "opponent_team"] = df.loc[~mask_home, "home_team"]
+
+    return df
+
+
+@st.cache_data(ttl=300)
 def get_deliveries_for_batter(batter_id: str):
     pages = []
     start = 0
@@ -174,6 +210,40 @@ def get_deliveries_for_batter(batter_id: str):
         df_page = _query_with_retry(
             sql,
             params={"batter_id": batter_id, "limit": page_size, "offset": start},
+            ttl=0,
+        )
+        if df_page.empty:
+            break
+        pages.append(df_page)
+        if len(df_page) < page_size:
+            break
+        start += page_size
+
+    if not pages:
+        return pd.DataFrame()
+    return _stringify_uuids(pd.concat(pages, ignore_index=True))
+
+
+@st.cache_data(ttl=300)
+def get_deliveries_for_bowler(bowler_id: str):
+    """Mirrors get_deliveries_for_batter, filtered on bowler_id instead --
+    used by the Bowling tab's per-bowler detail sections (batter-hand
+    breakdown, match-by-match ball-by-ball listing, position/phase splits,
+    boundary rate, highlights)."""
+    pages = []
+    start = 0
+    page_size = 1000
+
+    while True:
+        sql = """
+            SELECT * FROM deliveries
+            WHERE bowler_id = :bowler_id
+            ORDER BY innings_id, over, ball_number
+            LIMIT :limit OFFSET :offset
+        """
+        df_page = _query_with_retry(
+            sql,
+            params={"bowler_id": bowler_id, "limit": page_size, "offset": start},
             ttl=0,
         )
         if df_page.empty:
@@ -252,6 +322,67 @@ def get_bowler_summary():
         LEFT JOIN matches m ON m.match_id = d.match_id
         WHERE d.bowler_id IS NOT NULL
         GROUP BY d.bowler_id
+    """
+    df = _query_with_retry(sql, ttl=0)
+    return _stringify_uuids(df)
+
+
+@st.cache_data(ttl=300)
+def get_bowling_conceded_summary():
+    """
+    One row per (bowler_id, match_id, innings_id) with legal balls bowled,
+    runs conceded (charged to the bowler), and fours/sixes conceded --
+    aggregated server-side via GROUP BY so the full deliveries table never
+    has to cross the network just to power fours/sixes-conceded figures
+    (which don't exist as columns on player_innings for bowling rows) or
+    population-level boundary-rate comparisons on the Bowling tab.
+
+    Grouping by match_id + innings_id (not just bowler_id) lets the caller
+    filter this down to whatever subset of matches the sidebar filters
+    currently select, by inner-joining on the same (bowler_id, match_id,
+    innings_id) keys as the filtered player_innings rows -- rather than
+    always reflecting a bowler's whole career regardless of filters.
+
+    runs conceded uses deliveries.bowler_runs where populated (the ball's
+    true bowler-attributed runs, including wide/no-ball penalty runs but
+    excluding byes/leg-byes), falling back to batter_runs + wides + no_balls
+    for any rows where bowler_runs hasn't been backfilled.
+    """
+    sql = """
+        SELECT
+            bowler_id,
+            match_id,
+            innings_id,
+            COUNT(*) FILTER (WHERE wides = 0 AND no_balls = 0) AS legal_balls,
+            SUM(COALESCE(bowler_runs, batter_runs + wides + no_balls)) AS runs_conceded,
+            COUNT(*) FILTER (WHERE description ILIKE '%FOUR%') AS fours,
+            COUNT(*) FILTER (WHERE description ILIKE '%SIX%') AS sixes
+        FROM deliveries
+        WHERE bowler_id IS NOT NULL
+        GROUP BY bowler_id, match_id, innings_id
+    """
+    df = _query_with_retry(sql, ttl=0)
+    return _stringify_uuids(df)
+
+
+@st.cache_data(ttl=300)
+def get_wicket_deliveries():
+    """
+    One row per recorded dismissal in `deliveries` (bowler_id, batter_id,
+    dismissal_type, plus match/innings ids) -- NOT the full deliveries
+    table. This is the only place a per-wicket bowler attribution actually
+    exists: player_innings (role='bowling') only stores an aggregate
+    wickets_taken COUNT, with no per-dismissal detail or bowler_id-to-type
+    mapping. Filtering to `WHERE dismissal_type IS NOT NULL` keeps this to
+    roughly one row per wicket (a tiny fraction of all deliveries), so it's
+    an efficient stand-in for a "dismissals table" wherever a bowler-side
+    dismissal-type breakdown is needed (e.g. the population comparison on
+    the Bowling tab), without pulling every ball ever bowled.
+    """
+    sql = """
+        SELECT match_id, innings_id, bowler_id, batter_id, dismissed_player_id, dismissal_type
+        FROM deliveries
+        WHERE dismissal_type IS NOT NULL
     """
     df = _query_with_retry(sql, ttl=0)
     return _stringify_uuids(df)
