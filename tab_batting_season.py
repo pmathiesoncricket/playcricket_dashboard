@@ -42,7 +42,8 @@ TEAM_ROW_LABEL = "TEAM (all batters)"
 def _safe_fetch(fetch_fn, *args, label="data", **kwargs):
     """Wraps a db.py fetch call so a transient DB/connection-pool issue
     (e.g. sqlalchemy TimeoutError) shows a friendly warning instead of
-    crashing the whole app."""
+    crashing the whole app. db.py itself now also retries pool timeouts
+    with backoff before raising, so this is a second line of defence."""
     try:
         return fetch_fn(*args, **kwargs)
     except (OperationalError, SATimeoutError) as exc:
@@ -149,7 +150,9 @@ def _bowling_type_breakdown(legal_deliveries, style_lookup):
     """Metrics by bowling type: first the pace/spin/unknown rows, then an
     additional row per bowl_style (unknown styles bucketed together). The
     bowl_style rows will sum back to the pace/spin totals by construction,
-    which is expected/fine per requirements."""
+    which is expected/fine per requirements. `style_lookup` is passed in
+    (fetched once at the top of the tab) rather than re-fetched here, to
+    avoid opening extra DB connections per batter selection."""
     bd = legal_deliveries.merge(style_lookup, on="bowler_id", how="left")
     bd["pace_spin"] = bd["pace_spin"].fillna("Unknown")
     bd["bowl_style"] = bd["bowl_style"].fillna("Unknown")
@@ -192,6 +195,12 @@ def batting_season_tab():
 
     batting_df = add_season_column(batting_df, "day_1_start")
     matches_df = _safe_fetch(get_matches, label="matches")
+
+    # Fetch player_style ONCE for the whole tab and reuse everywhere below
+    # (bowling-type breakdown + highlights). Previously this was fetched
+    # twice per run, which doubled DB connection pressure for no benefit
+    # since the data doesn't change between the two uses.
+    style_lookup_all = _safe_fetch(get_player_style, label="player style")
 
     # ---------------- Top filters ----------------
     fcol1, fcol2 = st.columns(2)
@@ -475,31 +484,29 @@ def batting_season_tab():
         st.markdown(f"**Metrics by bowling type \u2014 {selected_batter}**")
         if b_deliveries.empty:
             st.info("No ball-by-ball data for this batter.")
+        elif style_lookup_all.empty:
+            st.info("Bowling style lookup unavailable right now.")
         else:
-            style_lookup = _safe_fetch(get_player_style, label="player style")
-            if style_lookup.empty:
-                st.info("Bowling style lookup unavailable right now.")
-            else:
-                style_lookup = style_lookup[["player_id", "pace_spin", "bowl_style"]].rename(
-                    columns={"player_id": "bowler_id"}
-                )
-                legal_b_deliveries = _legal_deliveries(b_deliveries)
-                by_bowl = _bowling_type_breakdown(legal_b_deliveries, style_lookup)
-                bb_disp = by_bowl.copy()
-                for col, dp in [("average", 2), ("SR", 0), ("BPD", 0), ("BPB", 1)]:
-                    bb_disp[col] = bb_disp[col].apply(lambda x, dp=dp: _fmt(x, dp))
-                st.dataframe(
-                    bb_disp[["level", "category", "runs", "average", "balls", "SR", "BPD", "BPB"]]
-                    .rename(columns={
-                        "level": "Level", "category": "Bowling type",
-                        "runs": "Runs", "average": "Average", "balls": "BF",
-                    }),
-                    width="stretch", hide_index=True,
-                )
-                st.caption(
-                    "Bowl style rows will sum back to the Pace / Spin totals above by "
-                    "definition \u2014 this is expected, not double counting."
-                )
+            style_lookup = style_lookup_all[["player_id", "pace_spin", "bowl_style"]].rename(
+                columns={"player_id": "bowler_id"}
+            )
+            legal_b_deliveries = _legal_deliveries(b_deliveries)
+            by_bowl = _bowling_type_breakdown(legal_b_deliveries, style_lookup)
+            bb_disp = by_bowl.copy()
+            for col, dp in [("average", 2), ("SR", 0), ("BPD", 0), ("BPB", 1)]:
+                bb_disp[col] = bb_disp[col].apply(lambda x, dp=dp: _fmt(x, dp))
+            st.dataframe(
+                bb_disp[["level", "category", "runs", "average", "balls", "SR", "BPD", "BPB"]]
+                .rename(columns={
+                    "level": "Level", "category": "Bowling type",
+                    "runs": "Runs", "average": "Average", "balls": "BF",
+                }),
+                width="stretch", hide_index=True,
+            )
+            st.caption(
+                "Bowl style rows will sum back to the Pace / Spin totals above by "
+                "definition \u2014 this is expected, not double counting."
+            )
 
         # ---- Highlights viewer (mirrors tab_batting.py pattern) ----
         st.markdown(f"**Highlights \u2014 {selected_batter}**")
@@ -512,9 +519,10 @@ def batting_season_tab():
                     matches_df[["match_id", "grade", "match_type", "day_1_start"]], on="match_id", how="left"
                 )
             highlights_df = add_season_column(highlights_df, "day_1_start")
-            style_lookup_h = _safe_fetch(get_player_style, label="player style")
-            if not style_lookup_h.empty:
-                style_lookup_h = style_lookup_h[["player_id", "pace_spin"]].rename(columns={"player_id": "bowler_id"})
+            # Reuse the same style_lookup_all fetched once at the top of the
+            # tab, instead of calling get_player_style() again here.
+            if not style_lookup_all.empty:
+                style_lookup_h = style_lookup_all[["player_id", "pace_spin"]].rename(columns={"player_id": "bowler_id"})
                 highlights_df = highlights_df.merge(style_lookup_h, on="bowler_id", how="left")
                 highlights_df["pace_spin"] = highlights_df["pace_spin"].fillna("Unknown")
             else:
