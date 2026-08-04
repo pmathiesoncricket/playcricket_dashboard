@@ -1,3 +1,4 @@
+
 import streamlit as st
 import pandas as pd
 import plotly.express as px
@@ -20,6 +21,23 @@ PHASES = [
 DISMISSAL_TYPES = ["Bowled", "LBW", "Caught", "Run Out", "Stumped"]
 OUTCOME_ORDER = ["0", "1", "2/3", "4", "6"]
 RUN_SHOT_ORDER = ["1", "2", "3", "4", "6"]
+
+# A richer, higher-contrast palette than a single maroon ramp -- keeps the
+# maroon "house" tone for brand consistency but adds distinct hues so 5-6
+# stacked segments stay easy to tell apart at a glance.
+RICH_PALETTE = [
+    "#8B1E3F",  # deep maroon (house colour)
+    "#C2185B",  # magenta
+    "#E07A5F",  # coral
+    "#F2B134",  # amber
+    "#4C956C",  # teal-green
+    "#2E86AB",  # blue
+]
+
+ROW_HEIGHT_PX = 32  # vertical space per row -- scales chart height with row count
+MIN_CHART_HEIGHT = 500
+
+TEAM_ROW_LABEL = "TEAM (all batters)"
 
 
 def _phase_of(over):
@@ -54,7 +72,7 @@ def _summary_table(df):
 
 
 def _legal_deliveries(deliveries_df):
-    """Legal balls only: exclude wides AND no-balls, per season-report definition."""
+    """Legal balls only: exclude wides AND no-balls."""
     d = deliveries_df.copy()
     d["wides"] = d["wides"].fillna(0)
     d["no_balls"] = d["no_balls"].fillna(0)
@@ -72,12 +90,12 @@ def _outcome_bucket(runs):
         return "4"
     if runs == 6:
         return "6"
-    return None  # ignore 5s/odd extras-only cases
+    return None  # ignore rarities (5s, etc.)
 
 
 def _pct_row_chart(pct_df, count_df, category_col, value_cols, title, order_labels, y_order):
-    """Builds a 100%-stacked horizontal bar chart matching the reference formatting
-    (row percents inside segments, category on y-axis, legend to the right)."""
+    """100%-stacked horizontal bar chart: percent inside segments, absolute
+    count in tooltip, richer palette, height scales with number of rows."""
     melt = pct_df.melt(id_vars=[category_col], value_vars=value_cols,
                         var_name="outcome", value_name="pct")
     counts = count_df.melt(id_vars=[category_col], value_vars=value_cols,
@@ -85,21 +103,28 @@ def _pct_row_chart(pct_df, count_df, category_col, value_cols, title, order_labe
     melt = melt.merge(counts, on=[category_col, "outcome"])
     melt["outcome"] = pd.Categorical(melt["outcome"], categories=order_labels, ordered=True)
 
+    chart_height = max(MIN_CHART_HEIGHT, ROW_HEIGHT_PX * len(y_order) + 160)
+
     fig = px.bar(
         melt, x="pct", y=category_col, color="outcome", orientation="h",
         category_orders={category_col: y_order, "outcome": order_labels},
         text=melt["pct"].apply(lambda x: f"{x:.0f}%" if pd.notna(x) and x >= 3 else ""),
         custom_data=["count"],
-        color_discrete_sequence=MAROON_SHADES,
+        color_discrete_sequence=RICH_PALETTE,
         title=title,
+        height=chart_height,
     )
     fig.update_traces(
         textposition="inside",
-        hovertemplate="%{y}<br>%{data.name}: %{x:.1f}% (n=%{customdata[0]})<extra></extra>",
+        hovertemplate="%{y}<br>%{data.name}: %{x:.1f}%% (n=%{customdata[0]})<extra></extra>",
     )
-    fig.update_layout(barmode="stack", xaxis_title="Percent", yaxis_title=None,
-                       legend_title_text=category_col.replace("_", " ").title())
+    fig.update_layout(
+        barmode="stack", xaxis_title="Percent", yaxis_title=None,
+        legend_title_text=category_col.replace("_", " ").title(),
+        margin=dict(l=10, r=10, t=60, b=40),
+    )
     fig.update_xaxes(ticksuffix="%")
+    fig.update_yaxes(automargin=True)
     return fig
 
 
@@ -139,8 +164,8 @@ def batting_season_tab():
     st.subheader("Batter summary")
     summary = _summary_table(stage_df)
 
-    legal_lookup_ids = tuple(summary["player_id"].dropna().unique().tolist())
-    deliveries_df = get_deliveries_for_batters(legal_lookup_ids)
+    all_batter_ids = tuple(summary["player_id"].dropna().unique().tolist())
+    deliveries_df = get_deliveries_for_batters(all_batter_ids)
     if not deliveries_df.empty:
         deliveries_df = deliveries_df.merge(
             matches_df[["match_id", "grade", "match_type", "day_1_start"]], on="match_id", how="left"
@@ -149,9 +174,7 @@ def batting_season_tab():
         if selected_season:
             deliveries_df = deliveries_df[deliveries_df["season"].isin(selected_season)]
         if selected_team:
-            deliveries_df = deliveries_df[
-                deliveries_df["batter_id"].isin(stage_df["player_id"])
-            ]
+            deliveries_df = deliveries_df[deliveries_df["batter_id"].isin(stage_df["player_id"])]
 
     legal_df = _legal_deliveries(deliveries_df) if not deliveries_df.empty else pd.DataFrame()
     if not legal_df.empty:
@@ -177,66 +200,139 @@ def batting_season_tab():
 
     st.dataframe(summary_table, width="stretch", hide_index=True)
 
-    # Batters eligible for the % breakdown charts (20+ legal balls faced)
-    qualified_ids = summary[summary["balls"] >= MIN_BALLS].sort_values("runs", ascending=False)
+    # =========================================================
+    # Percentage-breakdown charts (outcome / runs / dismissals)
+    # =========================================================
+    st.markdown("### Ball outcome & dismissal breakdowns")
+    st.caption(
+        "Filters below apply per-innings: selecting positions 1-6 only includes "
+        "innings where the batter actually batted in one of those positions."
+    )
+
+    fchcol1, fchcol2 = st.columns(2)
+
+    pos_options = sorted(stage_df["bat_position"].dropna().unique().astype(int).tolist())
+    with fchcol1:
+        selected_positions = st.multiselect(
+            "Batting position (per innings)", pos_options,
+            default=pos_options, key="season_report_batpos_filter",
+        )
+    with fchcol2:
+        min_bf = st.number_input(
+            "Minimum balls faced (across qualifying innings)", min_value=0, value=MIN_BALLS, step=5,
+            key="season_report_minbf_filter",
+        )
+
+    # Innings-level position filter: only keep innings where bat_position is
+    # in the selected set. This is the set of (match_id, innings_id, player_id)
+    # combos that "count" for both the qualifying-batter totals and the
+    # ball-by-ball charts below.
+    if selected_positions:
+        pos_filtered_innings = stage_df[stage_df["bat_position"].isin(selected_positions)]
+    else:
+        pos_filtered_innings = stage_df.iloc[0:0]
+
+    innings_keys = pos_filtered_innings[["match_id", "innings_id", "player_id"]].drop_duplicates()
+
+    # Recompute batter totals using only the position-filtered innings, so
+    # the "min balls faced" and "sort by balls" both reflect that scope.
+    pos_summary = _summary_table(pos_filtered_innings) if not pos_filtered_innings.empty else pd.DataFrame(
+        columns=["player_id", "player_name", "team", "balls", "runs"]
+    )
+
+    qualified_ids = pos_summary[pos_summary["balls"] >= min_bf].sort_values("balls", ascending=False)
     qualified_order = (
         qualified_ids["team"].astype(str) + " | " + qualified_ids["player_name"].astype(str)
     ).tolist()
 
-    if legal_df.empty:
-        st.info("No delivery-level data available for the outcome/runs/dismissal charts.")
+    if legal_df.empty or innings_keys.empty:
+        st.info("No delivery-level data available for the current filters.")
     else:
-        chart_df = legal_df.merge(
-            summary[["player_id", "player_name", "team", "runs"]],
+        # Restrict deliveries to balls belonging to the position-filtered
+        # innings only (join on match_id + innings_id + batter_id==player_id).
+        pos_legal_df = legal_df.merge(
+            innings_keys.rename(columns={"player_id": "batter_id"}),
+            on=["match_id", "innings_id", "batter_id"], how="inner",
+        )
+        pos_legal_df = pos_legal_df.merge(
+            summary[["player_id", "player_name", "team"]],
             left_on="batter_id", right_on="player_id", how="left",
         )
-        chart_df = chart_df[chart_df["batter_id"].isin(qualified_ids["player_id"])]
-        chart_df["row_label"] = chart_df["team"].astype(str) + " | " + chart_df["player_name"].astype(str)
 
-        # ---- Chart 1: balls faced by outcome ----
-        st.subheader("Balls faced by outcome (legal balls only)")
-        chart_df["outcome"] = chart_df["batter_runs"].apply(_outcome_bucket)
-        outc = chart_df.dropna(subset=["outcome"]).groupby(["row_label", "outcome"]).size().reset_index(name="n")
-        outc_totals = outc.groupby("row_label")["n"].sum().rename("total")
-        outc = outc.merge(outc_totals, on="row_label")
-        outc["pct"] = 100 * outc["n"] / outc["total"]
-        pct_wide = outc.pivot(index="row_label", columns="outcome", values="pct").reindex(columns=OUTCOME_ORDER).fillna(0).reset_index()
-        cnt_wide = outc.pivot(index="row_label", columns="outcome", values="n").reindex(columns=OUTCOME_ORDER).fillna(0).reset_index()
-        fig1 = _pct_row_chart(pct_wide, cnt_wide, "row_label", OUTCOME_ORDER,
-                               "Balls faced by outcome", OUTCOME_ORDER, list(reversed(qualified_order)))
-        st.plotly_chart(fig1, width="stretch")
+        qualified_chart_df = pos_legal_df[pos_legal_df["batter_id"].isin(qualified_ids["player_id"])].copy()
+        qualified_chart_df["row_label"] = (
+            qualified_chart_df["team"].astype(str) + " | " + qualified_chart_df["player_name"].astype(str)
+        )
 
-        # ---- Chart 2: runs scored breakdown ----
-        st.subheader("Runs scored by shot type")
-        scoring = chart_df[chart_df["batter_runs"].isin([1, 2, 3, 4, 6])].copy()
-        scoring["shot"] = scoring["batter_runs"].astype(int).astype(str)
-        scoring["runs_from_shot"] = scoring["batter_runs"]
-        runs_agg = scoring.groupby(["row_label", "shot"])["runs_from_shot"].sum().reset_index()
-        runs_totals = runs_agg.groupby("row_label")["runs_from_shot"].sum().rename("total")
-        runs_agg = runs_agg.merge(runs_totals, on="row_label")
-        runs_agg["pct"] = 100 * runs_agg["runs_from_shot"] / runs_agg["total"]
-        pct_wide2 = runs_agg.pivot(index="row_label", columns="shot", values="pct").reindex(columns=RUN_SHOT_ORDER).fillna(0).reset_index()
-        cnt_wide2 = runs_agg.pivot(index="row_label", columns="shot", values="runs_from_shot").reindex(columns=RUN_SHOT_ORDER).fillna(0).reset_index()
-        fig2 = _pct_row_chart(pct_wide2, cnt_wide2, "row_label", RUN_SHOT_ORDER,
-                               "Runs scored by shot type", RUN_SHOT_ORDER, list(reversed(qualified_order)))
-        st.plotly_chart(fig2, width="stretch")
+        # Team row reflects the whole team's legal balls within the current
+        # season/team selection (unaffected by the position/min-BF chart
+        # filters), giving a stable baseline to compare individual batters
+        # against.
+        team_chart_df = legal_df.copy()
+        team_chart_df["row_label"] = TEAM_ROW_LABEL
 
-        # ---- Chart 3: dismissal breakdown ----
-        st.subheader("Dismissal type breakdown")
-        dismiss_df = deliveries_df[
-            deliveries_df["dismissal_type"].isin(DISMISSAL_TYPES)
-            & deliveries_df["batter_id"].isin(qualified_ids["player_id"])
-        ].merge(summary[["player_id", "player_name", "team"]], left_on="batter_id", right_on="player_id", how="left")
-        dismiss_df["row_label"] = dismiss_df["team"].astype(str) + " | " + dismiss_df["player_name"].astype(str)
-        dis_agg = dismiss_df.groupby(["row_label", "dismissal_type"]).size().reset_index(name="n")
-        dis_totals = dis_agg.groupby("row_label")["n"].sum().rename("total")
-        dis_agg = dis_agg.merge(dis_totals, on="row_label")
-        dis_agg["pct"] = 100 * dis_agg["n"] / dis_agg["total"]
-        pct_wide3 = dis_agg.pivot(index="row_label", columns="dismissal_type", values="pct").reindex(columns=DISMISSAL_TYPES).fillna(0).reset_index()
-        cnt_wide3 = dis_agg.pivot(index="row_label", columns="dismissal_type", values="n").reindex(columns=DISMISSAL_TYPES).fillna(0).reset_index()
-        fig3 = _pct_row_chart(pct_wide3, cnt_wide3, "row_label", DISMISSAL_TYPES,
-                               "Dismissal type breakdown", DISMISSAL_TYPES, list(reversed(qualified_order)))
-        st.plotly_chart(fig3, width="stretch")
+        y_order_with_team = [TEAM_ROW_LABEL] + list(reversed(qualified_order))
+
+        if qualified_order:
+            # ---- Chart 1: balls faced by outcome ----
+            st.subheader("Balls faced by outcome (legal balls only)")
+            for d in (qualified_chart_df, team_chart_df):
+                d["outcome"] = d["batter_runs"].apply(_outcome_bucket)
+
+            combined1 = pd.concat([team_chart_df, qualified_chart_df], ignore_index=True)
+            outc = combined1.dropna(subset=["outcome"]).groupby(["row_label", "outcome"]).size().reset_index(name="n")
+            outc_totals = outc.groupby("row_label")["n"].sum().rename("total")
+            outc = outc.merge(outc_totals, on="row_label")
+            outc["pct"] = 100 * outc["n"] / outc["total"]
+            pct_wide = outc.pivot(index="row_label", columns="outcome", values="pct").reindex(columns=OUTCOME_ORDER).fillna(0).reset_index()
+            cnt_wide = outc.pivot(index="row_label", columns="outcome", values="n").reindex(columns=OUTCOME_ORDER).fillna(0).reset_index()
+            fig1 = _pct_row_chart(pct_wide, cnt_wide, "row_label", OUTCOME_ORDER,
+                                   "Balls faced by outcome", OUTCOME_ORDER, y_order_with_team)
+            st.plotly_chart(fig1, width="stretch")
+
+            # ---- Chart 2: runs scored breakdown ----
+            st.subheader("Runs scored by shot type")
+            combined2 = pd.concat([team_chart_df, qualified_chart_df], ignore_index=True)
+            scoring = combined2[combined2["batter_runs"].isin([1, 2, 3, 4, 6])].copy()
+            scoring["shot"] = scoring["batter_runs"].astype(int).astype(str)
+            runs_agg = scoring.groupby(["row_label", "shot"])["batter_runs"].sum().reset_index(name="runs_from_shot")
+            runs_totals = runs_agg.groupby("row_label")["runs_from_shot"].sum().rename("total")
+            runs_agg = runs_agg.merge(runs_totals, on="row_label")
+            runs_agg["pct"] = 100 * runs_agg["runs_from_shot"] / runs_agg["total"]
+            pct_wide2 = runs_agg.pivot(index="row_label", columns="shot", values="pct").reindex(columns=RUN_SHOT_ORDER).fillna(0).reset_index()
+            cnt_wide2 = runs_agg.pivot(index="row_label", columns="shot", values="runs_from_shot").reindex(columns=RUN_SHOT_ORDER).fillna(0).reset_index()
+            fig2 = _pct_row_chart(pct_wide2, cnt_wide2, "row_label", RUN_SHOT_ORDER,
+                                   "Runs scored by shot type", RUN_SHOT_ORDER, y_order_with_team)
+            st.plotly_chart(fig2, width="stretch")
+
+            # ---- Chart 3: dismissal breakdown ----
+            st.subheader("Dismissal type breakdown")
+            dismiss_all = deliveries_df[deliveries_df["dismissal_type"].isin(DISMISSAL_TYPES)].copy()
+            dismiss_all_pos = dismiss_all.merge(
+                innings_keys.rename(columns={"player_id": "batter_id"}),
+                on=["match_id", "innings_id", "batter_id"], how="inner",
+            )
+            dismiss_all_pos = dismiss_all_pos.merge(
+                summary[["player_id", "player_name", "team"]], left_on="batter_id", right_on="player_id", how="left"
+            )
+            dismiss_qual = dismiss_all_pos[dismiss_all_pos["batter_id"].isin(qualified_ids["player_id"])].copy()
+            dismiss_qual["row_label"] = dismiss_qual["team"].astype(str) + " | " + dismiss_qual["player_name"].astype(str)
+
+            dismiss_team = dismiss_all.copy()
+            dismiss_team["row_label"] = TEAM_ROW_LABEL
+
+            combined3 = pd.concat([dismiss_team, dismiss_qual], ignore_index=True)
+            dis_agg = combined3.groupby(["row_label", "dismissal_type"]).size().reset_index(name="n")
+            dis_totals = dis_agg.groupby("row_label")["n"].sum().rename("total")
+            dis_agg = dis_agg.merge(dis_totals, on="row_label")
+            dis_agg["pct"] = 100 * dis_agg["n"] / dis_agg["total"]
+            pct_wide3 = dis_agg.pivot(index="row_label", columns="dismissal_type", values="pct").reindex(columns=DISMISSAL_TYPES).fillna(0).reset_index()
+            cnt_wide3 = dis_agg.pivot(index="row_label", columns="dismissal_type", values="n").reindex(columns=DISMISSAL_TYPES).fillna(0).reset_index()
+            fig3 = _pct_row_chart(pct_wide3, cnt_wide3, "row_label", DISMISSAL_TYPES,
+                                   "Dismissal type breakdown", DISMISSAL_TYPES, y_order_with_team)
+            st.plotly_chart(fig3, width="stretch")
+        else:
+            st.info("No batters meet the current position / minimum balls faced filters.")
 
     # ---------------- One Day phase report ----------------
     od_df = stage_df[stage_df["match_type"] == "One Day"]
