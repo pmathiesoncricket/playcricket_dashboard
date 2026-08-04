@@ -21,9 +21,10 @@ WICKET_EXCLUDE_PATTERNS = ["run out", "retired", "obstruct"]
 
 # Dismissal types excluded from the dismissal-type DISTRIBUTION chart (a
 # different, narrower exclusion list than the wicket-credit rule above --
-# this one also drops Hit Wicket, which IS still credited as a bowler
-# wicket, just not shown in this particular type breakdown).
-DISMISSAL_DIST_EXCLUDE_PATTERNS = ["hit wicket", "obstruct", "retired", "run out"]
+# this one also drops Hit Wicket and Hit the Ball Twice, which ARE still
+# credited as bowler wickets, just not shown in this particular type
+# breakdown).
+DISMISSAL_DIST_EXCLUDE_PATTERNS = ["hit wicket", "ball twice", "obstruct", "retired", "run out"]
 
 # Over ranges are inclusive, matching deliveries.over as-is (40-over cricket)
 PHASES = [
@@ -100,7 +101,11 @@ def _legal_deliveries(deliveries_df):
 
 def _prep_bowling_deliveries(deliveries_df):
     """Adds the derived per-ball columns every bowling breakdown in this
-    tab depends on: is_legal, runs_charged, is_wicket, is_four, is_six."""
+    tab depends on: is_legal, runs_charged, is_wicket, is_four, is_six,
+    is_scoring. Fours/sixes are identified by batter_runs == 4 / 6 (runs
+    actually scored off the bat) -- not by parsing the free-text
+    `description` column, which doesn't reliably contain "FOUR"/"SIX" and
+    was previously causing every boundary figure on this tab to read 0."""
     d = _legal_deliveries(deliveries_df)
     d["is_legal"] = (d["wides"] == 0) & (d["no_balls"] == 0)
     if "bowler_runs" in d.columns:
@@ -109,14 +114,18 @@ def _prep_bowling_deliveries(deliveries_df):
     else:
         d["runs_charged"] = d["batter_runs"].fillna(0) + d["wides"].fillna(0) + d["no_balls"].fillna(0)
     d["is_wicket"] = d["dismissal_type"].apply(is_bowler_wicket)
-    d["is_four"] = d["description"].str.contains("FOUR", case=False, na=False)
-    d["is_six"] = d["description"].str.contains("SIX", case=False, na=False)
+    d["is_four"] = d["batter_runs"] == 4
+    d["is_six"] = d["batter_runs"] == 6
+    d["is_scoring"] = d["is_legal"] & (d["batter_runs"].fillna(0) > 0)
     return d
 
 
 def _bowling_metrics(df, group_cols):
-    """Core bowling metrics (wickets/average/economy/BPD/fours/sixes) from
-    prepped ball-by-ball data, grouped by `group_cols`."""
+    """Core bowling metrics from prepped ball-by-ball data, grouped by
+    `group_cols`: average/economy/BPD from wickets/runs/balls, plus
+    Balls Per Boundary (BPB) and Scoring Shot % in place of raw
+    fours/sixes counts (which read misleadingly small/zero once split
+    across many thin category buckets)."""
     if isinstance(group_cols, str):
         group_cols = [group_cols]
     g = df.groupby(group_cols, dropna=False).agg(
@@ -125,10 +134,16 @@ def _bowling_metrics(df, group_cols):
         wickets=("is_wicket", "sum"),
         fours=("is_four", "sum"),
         sixes=("is_six", "sum"),
+        scoring_balls=("is_scoring", "sum"),
     ).reset_index()
+    g["boundaries"] = g["fours"] + g["sixes"]
     g["average"] = g.apply(lambda r: r["runs_conceded"] / r["wickets"] if r["wickets"] > 0 else None, axis=1)
     g["economy"] = g.apply(lambda r: r["runs_conceded"] / (r["balls"] / 6) if r["balls"] > 0 else None, axis=1)
     g["BPD"] = g.apply(lambda r: r["balls"] / r["wickets"] if r["wickets"] > 0 else None, axis=1)
+    g["BPB"] = g.apply(lambda r: r["balls"] / r["boundaries"] if r["boundaries"] > 0 else None, axis=1)
+    g["scoring_shot_pct"] = g.apply(
+        lambda r: 100 * r["scoring_balls"] / r["balls"] if r["balls"] > 0 else None, axis=1,
+    )
     return g
 
 
@@ -148,13 +163,15 @@ def _render_metrics_table(df, category_col, category_label, sort_col="wickets"):
     disp["average"] = disp["average"].apply(lambda x: _fmt(x, 2))
     disp["economy"] = disp["economy"].apply(lambda x: _fmt(x, 2))
     disp["BPD"] = disp["BPD"].apply(lambda x: _fmt(x, 0) if pd.notna(x) else DASH)
+    disp["BPB"] = disp["BPB"].apply(lambda x: _fmt(x, 1) if pd.notna(x) else DASH)
+    disp["scoring_shot_pct"] = disp["scoring_shot_pct"].apply(lambda x: _fmt(x, 1) if pd.notna(x) else DASH)
 
     st.dataframe(
-        disp[[category_col, "wickets", "runs_conceded", "average", "economy", "BPD", "fours", "sixes"]]
+        disp[[category_col, "wickets", "runs_conceded", "average", "economy", "BPD", "BPB", "scoring_shot_pct"]]
         .rename(columns={
             category_col: category_label, "wickets": "Wickets", "runs_conceded": "Runs",
             "average": "Average", "economy": "Economy", "BPD": "BPD",
-            "fours": "Fours", "sixes": "Sixes",
+            "BPB": "BPB", "scoring_shot_pct": "Scoring shot %",
         }),
         width="stretch", hide_index=True,
     )
