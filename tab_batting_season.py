@@ -37,6 +37,7 @@ ROW_HEIGHT_PX = 32  # vertical space per row -- scales chart height with row cou
 MIN_CHART_HEIGHT = 500
 
 TEAM_ROW_LABEL = "TEAM (all batters)"
+UNKNOWN_LABEL = "Unknown"
 
 
 def _safe_fetch(fetch_fn, *args, label="data", **kwargs):
@@ -146,78 +147,108 @@ def _pct_row_chart(pct_df, count_df, category_col, value_cols, title, order_labe
     return fig
 
 
-def _bowling_type_breakdown(legal_deliveries, style_lookup):
-    """Metrics by bowling type: first the pace/spin/unknown rows, then an
-    additional row per bowl_style (unknown styles bucketed together). The
-    bowl_style rows will sum back to the pace/spin totals by construction,
-    which is expected/fine per requirements. `style_lookup` is passed in
-    (fetched once at the top of the tab) rather than re-fetched here, to
-    avoid opening extra DB connections per batter selection."""
+def _one_level_breakdown(bd, group_col):
+    """Aggregate legal deliveries by a single grouping column (pace_spin OR
+    bowl_style), always including an 'Unknown' row/bucket for any bowler
+    that couldn't be matched to a player_style record (or had a null value
+    for that specific column)."""
+    g = bd.groupby(group_col, dropna=False).agg(
+        runs=("batter_runs", "sum"),
+        balls=("batter_runs", "count"),
+        dismissals=("dismissal_type", lambda x: x.notna().sum()),
+        fours=("description", lambda x: x.str.contains("FOUR", case=False, na=False).sum()),
+        sixes=("description", lambda x: x.str.contains("SIX", case=False, na=False).sum()),
+    ).reset_index().rename(columns={group_col: "category"})
+    g["average"] = g.apply(lambda r: r["runs"] / r["dismissals"] if r["dismissals"] > 0 else None, axis=1)
+    g["SR"] = g.apply(lambda r: 100 * r["runs"] / r["balls"] if r["balls"] > 0 else None, axis=1)
+    g["BPD"] = g.apply(lambda r: r["balls"] / r["dismissals"] if r["dismissals"] > 0 else None, axis=1)
+    g["boundaries"] = g["fours"] + g["sixes"]
+    g["BPB"] = g.apply(lambda r: r["balls"] / r["boundaries"] if r["boundaries"] > 0 else None, axis=1)
+    return g.sort_values("runs", ascending=False).reset_index(drop=True)
+
+
+def _bowling_type_breakdowns(legal_deliveries, style_lookup):
+    """Returns two SEPARATE dataframes:
+      1. Breakdown by pace_spin (Pace / Spin / Unknown)
+      2. Breakdown by bowl_style (each specific style / Unknown)
+    Both are computed from the SAME merged delivery set, but reported as two
+    distinct tables so the bowl_style detail isn't buried underneath the
+    pace_spin rows. Any bowler that doesn't match a player_style row at all,
+    or has a null value in either column specifically, falls into an
+    'Unknown' bucket for that column so no deliveries are silently dropped."""
     bd = legal_deliveries.merge(style_lookup, on="bowler_id", how="left")
-    bd["pace_spin"] = bd["pace_spin"].fillna("Unknown")
-    bd["bowl_style"] = bd["bowl_style"].fillna("Unknown")
+    bd["pace_spin"] = bd["pace_spin"].fillna(UNKNOWN_LABEL)
+    bd["pace_spin"] = bd["pace_spin"].replace("", UNKNOWN_LABEL)
+    bd["bowl_style"] = bd["bowl_style"].fillna(UNKNOWN_LABEL)
+    bd["bowl_style"] = bd["bowl_style"].replace("", UNKNOWN_LABEL)
 
-    def _agg(d, group_col):
-        g = d.groupby(group_col).agg(
-            runs=("batter_runs", "sum"),
-            balls=("batter_runs", "count"),
-            dismissals=("dismissal_type", lambda x: x.notna().sum()),
-            fours=("description", lambda x: x.str.contains("FOUR", case=False, na=False).sum()),
-            sixes=("description", lambda x: x.str.contains("SIX", case=False, na=False).sum()),
-        ).reset_index().rename(columns={group_col: "category"})
-        g["average"] = g.apply(lambda r: r["runs"] / r["dismissals"] if r["dismissals"] > 0 else None, axis=1)
-        g["SR"] = g.apply(lambda r: 100 * r["runs"] / r["balls"] if r["balls"] > 0 else None, axis=1)
-        g["BPD"] = g.apply(lambda r: r["balls"] / r["dismissals"] if r["dismissals"] > 0 else None, axis=1)
-        g["boundaries"] = g["fours"] + g["sixes"]
-        g["BPB"] = g.apply(lambda r: r["balls"] / r["boundaries"] if r["boundaries"] > 0 else None, axis=1)
-        return g
+    pace_spin_df = _one_level_breakdown(bd, "pace_spin")
+    bowl_style_df = _one_level_breakdown(bd, "bowl_style")
+    return pace_spin_df, bowl_style_df
 
-    pace_spin_rows = _agg(bd, "pace_spin")
-    pace_spin_rows["level"] = "Pace / Spin"
 
-    style_rows = _agg(bd, "bowl_style")
-    style_rows["level"] = "Bowl style"
-
-    combined = pd.concat([
-        pace_spin_rows.sort_values("runs", ascending=False),
-        style_rows.sort_values("runs", ascending=False),
-    ], ignore_index=True)
-    return combined
+def _render_breakdown_table(df, category_label):
+    disp = df.copy()
+    for col, dp in [("average", 2), ("SR", 0), ("BPD", 0), ("BPB", 1)]:
+        disp[col] = disp[col].apply(lambda x, dp=dp: _fmt(x, dp))
+    st.dataframe(
+        disp[["category", "runs", "average", "balls", "SR", "BPD", "BPB"]]
+        .rename(columns={
+            "category": category_label, "runs": "Runs", "average": "Average", "balls": "BF",
+        }),
+        width="stretch", hide_index=True,
+    )
 
 
 def batting_season_tab():
     st.header("Batting Season Report")
 
+    # ---------------- Top filters (lightweight only) ----------------
+    # Season/team options are derived from get_matches() only, NOT from
+    # get_batting_innings()/get_deliveries_for_batters()/get_highlights().
+    # Those heavier queries are deferred until BOTH a season and a team are
+    # selected below -- there's no meaningful report without both, so there
+    # is no reason to hit the DB for them (and hold a connection open) on
+    # every page load / rerun before the user has picked anything.
+    matches_df = _safe_fetch(get_matches, label="matches")
+    if matches_df.empty:
+        st.info("No match data available.")
+        return
+
+    matches_df = add_season_column(matches_df, "day_1_start")
+    season_options = (
+        matches_df["season"].dropna().drop_duplicates().sort_values(ascending=False).tolist()
+    )
+
+    fcol1, fcol2 = st.columns(2)
+    with fcol1:
+        selected_season = st.multiselect("Season", season_options, key="season_report_season")
+
+    season_matches = matches_df[matches_df["season"].isin(selected_season)] if selected_season else matches_df
+    team_options = sorted(
+        pd.concat([season_matches["home_team"], season_matches["away_team"]]).dropna().unique().tolist()
+    )
+    with fcol2:
+        selected_team = st.multiselect("Team (batting team)", team_options, key="season_report_team")
+
+    if not selected_season or not selected_team:
+        st.info("Select at least one season AND at least one team to load the batting season report.")
+        return
+
+    # ---------------- Heavier fetches (only once season + team chosen) ----------------
     batting_df = _safe_fetch(get_batting_innings, label="batting innings")
     if batting_df.empty:
         st.info("No batting data available.")
         return
 
     batting_df = add_season_column(batting_df, "day_1_start")
-    matches_df = _safe_fetch(get_matches, label="matches")
 
     # Fetch player_style ONCE for the whole tab and reuse everywhere below
-    # (bowling-type breakdown + highlights). Previously this was fetched
-    # twice per run, which doubled DB connection pressure for no benefit
-    # since the data doesn't change between the two uses.
+    # (bowling-type breakdown + highlights).
     style_lookup_all = _safe_fetch(get_player_style, label="player style")
 
-    # ---------------- Top filters ----------------
-    fcol1, fcol2 = st.columns(2)
-    season_options = (
-        batting_df["season"].dropna().drop_duplicates().sort_values(ascending=False).tolist()
-    )
-    with fcol1:
-        selected_season = st.multiselect("Season", season_options, key="season_report_season")
-    stage_df = batting_df.copy()
-    if selected_season:
-        stage_df = stage_df[stage_df["season"].isin(selected_season)]
-
-    team_options = sorted(stage_df["team"].dropna().unique().tolist())
-    with fcol2:
-        selected_team = st.multiselect("Team (batting team)", team_options, key="season_report_team")
-    if selected_team:
-        stage_df = stage_df[stage_df["team"].isin(selected_team)]
+    stage_df = batting_df[batting_df["season"].isin(selected_season)]
+    stage_df = stage_df[stage_df["team"].isin(selected_team)]
 
     if stage_df.empty:
         st.warning("No batting records match the selected season/team.")
@@ -229,15 +260,12 @@ def batting_season_tab():
 
     all_batter_ids = tuple(summary["player_id"].dropna().unique().tolist())
     deliveries_df = _safe_fetch(get_deliveries_for_batters, all_batter_ids, label="deliveries")
-    if not deliveries_df.empty and not matches_df.empty:
+    if not deliveries_df.empty:
         deliveries_df = deliveries_df.merge(
-            matches_df[["match_id", "grade", "match_type", "day_1_start"]], on="match_id", how="left"
+            matches_df[["match_id", "grade", "match_type", "day_1_start", "season"]], on="match_id", how="left"
         )
-        deliveries_df = add_season_column(deliveries_df, "day_1_start")
-        if selected_season:
-            deliveries_df = deliveries_df[deliveries_df["season"].isin(selected_season)]
-        if selected_team:
-            deliveries_df = deliveries_df[deliveries_df["batter_id"].isin(stage_df["player_id"])]
+        deliveries_df = deliveries_df[deliveries_df["season"].isin(selected_season)]
+        deliveries_df = deliveries_df[deliveries_df["batter_id"].isin(stage_df["player_id"])]
 
     legal_df = _legal_deliveries(deliveries_df) if not deliveries_df.empty else pd.DataFrame()
     if not legal_df.empty:
@@ -286,10 +314,6 @@ def batting_season_tab():
             key="season_report_minbf_filter",
         )
 
-    # Innings-level position filter: only keep innings where bat_position is
-    # in the selected set. This is the set of (match_id, innings_id, player_id)
-    # combos that "count" for both the qualifying-batter totals and the
-    # ball-by-ball charts below.
     if selected_positions:
         pos_filtered_innings = stage_df[stage_df["bat_position"].isin(selected_positions)]
     else:
@@ -297,8 +321,6 @@ def batting_season_tab():
 
     innings_keys = pos_filtered_innings[["match_id", "innings_id", "player_id"]].drop_duplicates()
 
-    # Recompute batter totals using only the position-filtered innings, so
-    # the "min balls faced" and "sort by balls" both reflect that scope.
     pos_summary = _summary_table(pos_filtered_innings) if not pos_filtered_innings.empty else pd.DataFrame(
         columns=["player_id", "player_name", "team", "balls", "runs"]
     )
@@ -311,8 +333,6 @@ def batting_season_tab():
     if legal_df.empty or innings_keys.empty:
         st.info("No delivery-level data available for the current filters.")
     else:
-        # Restrict deliveries to balls belonging to the position-filtered
-        # innings only (join on match_id + innings_id + batter_id==player_id).
         pos_legal_df = legal_df.merge(
             innings_keys.rename(columns={"player_id": "batter_id"}),
             on=["match_id", "innings_id", "batter_id"], how="inner",
@@ -327,10 +347,6 @@ def batting_season_tab():
             qualified_chart_df["team"].astype(str) + " | " + qualified_chart_df["player_name"].astype(str)
         )
 
-        # Team row reflects the whole team's legal balls within the current
-        # season/team selection (unaffected by the position/min-BF chart
-        # filters), giving a stable baseline to compare individual batters
-        # against.
         team_chart_df = legal_df.copy()
         team_chart_df["row_label"] = TEAM_ROW_LABEL
 
@@ -491,21 +507,18 @@ def batting_season_tab():
                 columns={"player_id": "bowler_id"}
             )
             legal_b_deliveries = _legal_deliveries(b_deliveries)
-            by_bowl = _bowling_type_breakdown(legal_b_deliveries, style_lookup)
-            bb_disp = by_bowl.copy()
-            for col, dp in [("average", 2), ("SR", 0), ("BPD", 0), ("BPB", 1)]:
-                bb_disp[col] = bb_disp[col].apply(lambda x, dp=dp: _fmt(x, dp))
-            st.dataframe(
-                bb_disp[["level", "category", "runs", "average", "balls", "SR", "BPD", "BPB"]]
-                .rename(columns={
-                    "level": "Level", "category": "Bowling type",
-                    "runs": "Runs", "average": "Average", "balls": "BF",
-                }),
-                width="stretch", hide_index=True,
-            )
+            pace_spin_df, bowl_style_df = _bowling_type_breakdowns(legal_b_deliveries, style_lookup)
+
+            st.markdown("*By pace / spin*")
+            _render_breakdown_table(pace_spin_df, "Pace / Spin")
+
+            st.markdown("*By bowl style*")
+            _render_breakdown_table(bowl_style_df, "Bowl style")
+
             st.caption(
-                "Bowl style rows will sum back to the Pace / Spin totals above by "
-                "definition \u2014 this is expected, not double counting."
+                "Both tables are computed from the same deliveries faced, just grouped "
+                "differently -- 'Unknown' captures any bowler with no matching (or "
+                "blank) value for that specific column in player_style."
             )
 
         # ---- Highlights viewer (mirrors tab_batting.py pattern) ----
@@ -514,19 +527,17 @@ def batting_season_tab():
         if highlights_df.empty:
             st.info("No highlights available (or they could not be loaded \u2014 see warning above, if any).")
         else:
-            if not matches_df.empty:
-                highlights_df = highlights_df.merge(
-                    matches_df[["match_id", "grade", "match_type", "day_1_start"]], on="match_id", how="left"
-                )
-            highlights_df = add_season_column(highlights_df, "day_1_start")
+            highlights_df = highlights_df.merge(
+                matches_df[["match_id", "grade", "match_type", "day_1_start", "season"]], on="match_id", how="left"
+            )
             # Reuse the same style_lookup_all fetched once at the top of the
             # tab, instead of calling get_player_style() again here.
             if not style_lookup_all.empty:
                 style_lookup_h = style_lookup_all[["player_id", "pace_spin"]].rename(columns={"player_id": "bowler_id"})
                 highlights_df = highlights_df.merge(style_lookup_h, on="bowler_id", how="left")
-                highlights_df["pace_spin"] = highlights_df["pace_spin"].fillna("Unknown")
+                highlights_df["pace_spin"] = highlights_df["pace_spin"].fillna(UNKNOWN_LABEL)
             else:
-                highlights_df["pace_spin"] = "Unknown"
+                highlights_df["pace_spin"] = UNKNOWN_LABEL
 
             h = highlights_df[highlights_df["batter_id"] == str(b_id)]
             if selected_season and "season" in h.columns:
