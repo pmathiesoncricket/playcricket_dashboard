@@ -133,18 +133,29 @@ def _bowling_metrics(df, group_cols):
 
 
 def _render_metrics_table(df, category_col, category_label, sort_col="wickets"):
+    """Renders a bowling-metrics table. Sorting is done BEFORE the display
+    rename (sorting after rename was the source of a KeyError, since
+    "wickets"/the category column no longer existed under their original
+    names post-rename). When sort_col is the category column itself
+    (e.g. an ordered phase/position categorical), we sort ascending to
+    preserve its natural order; otherwise (e.g. "wickets") we sort
+    descending so the best performers show first.
+    """
     disp = df.copy()
+    ascending = sort_col == category_col
+    disp = disp.sort_values(sort_col, ascending=ascending)
+
     disp["average"] = disp["average"].apply(lambda x: _fmt(x, 2))
     disp["economy"] = disp["economy"].apply(lambda x: _fmt(x, 2))
     disp["BPD"] = disp["BPD"].apply(lambda x: _fmt(x, 0) if pd.notna(x) else DASH)
+
     st.dataframe(
         disp[[category_col, "wickets", "runs_conceded", "average", "economy", "BPD", "fours", "sixes"]]
         .rename(columns={
             category_col: category_label, "wickets": "Wickets", "runs_conceded": "Runs",
             "average": "Average", "economy": "Economy", "BPD": "BPD",
             "fours": "Fours", "sixes": "Sixes",
-        })
-        .sort_values(sort_col, ascending=False),
+        }),
         width="stretch", hide_index=True,
     )
 
@@ -319,11 +330,7 @@ def bowling_tab():
 
     summary_table = display_df[
         ["player_name", "innings", "wickets", "average", "economy", "BPD", "fours", "sixes"]
-    ].rename(columns={
-        "player_name": "player_name", "innings": "innings", "wickets": "wickets",
-    }).sort_values("wickets", ascending=False).reset_index(drop=True)
-    # Keep the raw numeric "wickets" column for sorting, but grouped["wickets"]
-    # may be float from the aggregation -- tidy to int for display.
+    ].sort_values("wickets", ascending=False).reset_index(drop=True)
     summary_table["wickets"] = summary_table["wickets"].fillna(0).astype(int)
 
     MAX_ROWS_VISIBLE = 10
