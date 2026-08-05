@@ -1,16 +1,3 @@
-import re
-import streamlit as st
-import pandas as pd
-
-from db import get_matches, get_innings, get_batting_innings, get_bowling_innings, get_deliveries_for_match
-from helpers import add_season_column, cascading_multiselect
-# Reuse the overs<->balls conversion and the bowling-metric prep helpers
-# already ironed out on the Bowling tab, rather than re-deriving them.
-from tab_bowling import overs_to_balls, _prep_bowling_deliveries
-
-DASH = "\u2013"
-
-
 def _fmt(x, dp=2):
     return f"{x:.{dp}f}" if pd.notna(x) else DASH
 
@@ -84,26 +71,29 @@ def match_summary_tab():
         return
     matches_df = add_season_column(matches_df, "day_1_start")
 
-    st.sidebar.markdown("### Match Summary filters")
-    st.sidebar.caption("Filters are interdependent \u2014 each one narrows the options below it.")
+    st.markdown("#### Filters")
+    st.caption("Filters are interdependent \u2014 each one narrows the options below it. "
+               "These filters apply only to this page.")
 
     stage_matches = matches_df.copy()
 
+    row1_col1, row1_col2, row1_col3 = st.columns(3)
+
     grade_options = sorted(stage_matches["grade"].dropna().unique().tolist())
-    selected_grade = cascading_multiselect(st.sidebar, "Grade", grade_options, "ms_filter_grade")
+    selected_grade = cascading_multiselect(row1_col1, "Grade", grade_options, "ms_filter_grade")
     if selected_grade:
         stage_matches = stage_matches[stage_matches["grade"].isin(selected_grade)]
 
     season_options = (
         stage_matches["season"].dropna().drop_duplicates().sort_values(ascending=False).tolist()
     )
-    selected_season = cascading_multiselect(st.sidebar, "Season (July\u2013June)", season_options, "ms_filter_season")
+    selected_season = cascading_multiselect(row1_col2, "Season (July\u2013June)", season_options, "ms_filter_season")
     if selected_season:
         stage_matches = stage_matches[stage_matches["season"].isin(selected_season)]
 
     match_type_options = sorted(stage_matches["match_type"].dropna().unique().tolist())
     selected_match_type = cascading_multiselect(
-        st.sidebar, "Match type", match_type_options, "ms_filter_match_type",
+        row1_col3, "Match type", match_type_options, "ms_filter_match_type",
         default_options=match_type_options,
     )
     if selected_match_type:
@@ -112,6 +102,8 @@ def match_summary_tab():
     if stage_matches.empty:
         st.warning("No matches match the current filters.")
         return
+
+    row2_col1, row2_col2, row2_col3 = st.columns(3)
 
     # ---- Team (single-select; drives BOTH the batting and bowling sides
     # of the report, since the whole page is "one team's match", mirroring
@@ -123,11 +115,11 @@ def match_summary_tab():
         ["\u2014 select \u2014"] + team_options
     ):
         st.session_state["ms_filter_team"] = "\u2014 select \u2014"
-    selected_team = st.sidebar.selectbox(
+    selected_team = row2_col1.selectbox(
         "Team", ["\u2014 select \u2014"] + team_options, key="ms_filter_team"
     )
     if selected_team == "\u2014 select \u2014":
-        st.info("Select a team in the sidebar to continue.")
+        st.info("Select a team above to continue.")
         return
 
     team_matches = stage_matches[
@@ -146,7 +138,7 @@ def match_summary_tab():
         ["All opponents"] + opponent_options
     ):
         st.session_state["ms_filter_opponent"] = "All opponents"
-    selected_opponent = st.sidebar.selectbox(
+    selected_opponent = row2_col2.selectbox(
         "Opposition", ["All opponents"] + opponent_options, key="ms_filter_opponent"
     )
     if selected_opponent != "All opponents":
@@ -167,10 +159,12 @@ def match_summary_tab():
     if "ms_filter_match" in st.session_state and st.session_state["ms_filter_match"] not in match_options:
         st.session_state.pop("ms_filter_match", None)
 
-    selected_match_label = st.sidebar.selectbox("Match", match_options, key="ms_filter_match")
+    selected_match_label = row2_col3.selectbox("Match", match_options, key="ms_filter_match")
     match_row = team_matches[team_matches["match_label"] == selected_match_label].iloc[0]
     match_id = match_row["match_id"]
     opponent_name = match_row["away_team"] if match_row["home_team"] == selected_team else match_row["home_team"]
+
+    st.divider()
 
     _render_match_report(match_id, selected_team, opponent_name, match_row)
 
