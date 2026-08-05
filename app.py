@@ -1,3 +1,4 @@
+
 import streamlit as st
 
 from tab_batting import batting_tab
@@ -11,28 +12,25 @@ from tab_team import team_tab
 st.set_page_config(page_title="PlayCricket Dashboard", layout="wide")
 st.title("PlayCricket Dashboard")
 
-# NOTE: st.tabs() runs the code inside EVERY `with tabs[i]:` block on every
-# rerun, regardless of which tab is actually visible in the UI -- this is a
-# Streamlit platform limitation, not something configurable. That means all
-# seven tabs' database queries fire on every interaction, not just the one
-# you're looking at. If that becomes a problem again, the fix is either a
-# "Load report" button gating each tab's body, or going back to a
-# single-active-page selector (e.g. st.sidebar.radio) instead of tabs.
-tabs = st.tabs(
-    ["Batting", "Batting Season Report", "Bowling", "Bowler Style", "Batter Style", "Match Summary", "Team"]
-)
+# A sidebar dropdown selector (instead of st.tabs) means only the currently
+# selected page's function actually executes on each rerun. st.tabs()
+# unconditionally runs the code inside EVERY tab on every rerun regardless
+# of which one is visible -- this is what was driving the load times up
+# with 7 tabs' worth of DB queries firing at once. With a selectbox, the
+# other six pages' queries simply never run until you pick them.
 
-with tabs[0]:
-    batting_tab()
-with tabs[1]:
-    batting_season_tab()
-with tabs[2]:
-    bowling_tab()
-with tabs[3]:
-    bowler_style_tab()
-with tabs[4]:
-    batter_style_tab()
-with tabs[5]:
-    match_summary_tab()
-with tabs[6]:
-    team_tab()
+PAGES = {
+    "Batting": batting_tab,
+    "Batting Season Report": batting_season_tab,
+    "Bowling": bowling_tab,
+    "Bowler Style": bowler_style_tab,
+    "Batter Style": batter_style_tab,
+    "Match Summary": match_summary_tab,
+    "Team": team_tab,
+}
+
+st.sidebar.markdown("### Navigation")
+selected_page = st.sidebar.selectbox("Report", list(PAGES.keys()), key="nav_page")
+
+page_fn = PAGES[selected_page]
+page_fn()
