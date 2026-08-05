@@ -386,6 +386,29 @@ def get_bowler_summary():
 
 
 @st.cache_data(ttl=300)
+def get_batter_summary():
+    """
+    One row per batter with total balls faced and the set of grades they
+    appear in -- mirrors get_bowler_summary() exactly (same GROUP BY
+    approach), just keyed on batter_id/batter instead of bowler_id/bowler.
+    Powers the Batter Style tab.
+    """
+    sql = """
+        SELECT
+            d.batter_id,
+            MAX(d.batter) AS batter_name,
+            COUNT(*) AS balls,
+            array_agg(DISTINCT m.grade) AS grades
+        FROM deliveries d
+        LEFT JOIN matches m ON m.match_id = d.match_id
+        WHERE d.batter_id IS NOT NULL
+        GROUP BY d.batter_id
+    """
+    df = _query_with_retry(sql, ttl=0)
+    return _stringify_uuids(df)
+
+
+@st.cache_data(ttl=300)
 def get_bowling_conceded_summary():
     """
     One row per (bowler_id, match_id, innings_id) with legal balls bowled,
@@ -485,6 +508,48 @@ def get_highlights_for_bowlers(bowler_ids: tuple[str, ...], max_per_bowler: int 
         FROM ranked
         WHERE rn <= :max_per_bowler
         ORDER BY bowler_id, rn
+    """
+
+    df = _query_with_retry(sql, params=params, ttl=0)
+    return _stringify_uuids(df)
+
+
+@st.cache_data(ttl=300)
+def get_highlights_for_batters(batter_ids: tuple[str, ...], max_per_batter: int = 10):
+    """
+    Fetch up to `max_per_batter` highlights per batter for the provided set
+    of batters, newest first within each batter -- mirrors
+    get_highlights_for_bowlers() exactly, just partitioned by batter_id.
+    Powers the Batter Style tab.
+    """
+    if not batter_ids:
+        return pd.DataFrame()
+
+    params = {"max_per_batter": max_per_batter}
+    placeholders = []
+
+    for i, bid in enumerate(batter_ids):
+        key = f"bid_{i}"
+        placeholders.append(f":{key}")
+        params[key] = bid
+
+    in_sql = ", ".join(placeholders)
+
+    sql = f"""
+        WITH ranked AS (
+            SELECT
+                h.*,
+                ROW_NUMBER() OVER (
+                    PARTITION BY h.batter_id
+                    ORDER BY h.match_id DESC, h.innings_number, h.over, h.ball_number
+                ) AS rn
+            FROM highlights h
+            WHERE h.batter_id IN ({in_sql})
+        )
+        SELECT *
+        FROM ranked
+        WHERE rn <= :max_per_batter
+        ORDER BY batter_id, rn
     """
 
     df = _query_with_retry(sql, params=params, ttl=0)
