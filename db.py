@@ -124,9 +124,30 @@ def fetch_all_rows(table_name: str, select_str: str, eq_filters: dict | None = N
 def get_matches():
     return fetch_all_rows(
         "matches",
-        "match_id, grade, match_type, day_1_start, day_2_start, home_team_id, home_team, "
-        "away_team_id, away_team, organisation_id, competition_id, competition_name, "
+        "match_id, grade, match_type, round, venue, ground, day_1_start, day_2_start, "
+        "home_team_id, home_team, away_team_id, away_team, result_text, "
+        "organisation_id, competition_id, competition_name, "
         "day1_stream_url, day1_stream_start, day2_stream_url, day2_stream_start",
+        order_col="match_id",
+    )
+
+
+@st.cache_data(ttl=300)
+def get_innings():
+    """
+    Full `innings` table -- one row per innings with the OFFICIAL runs,
+    wickets, overs and extras breakdown (byes/leg byes/wides/no-balls/
+    penalties). This is the only place total innings extras exist; the
+    per-player batting/bowling figures in player_innings don't carry them.
+    Powers the Match Summary tab's score-summary lines and the
+    "team total vs sum of individual batting figures" extras note.
+    """
+    return fetch_all_rows(
+        "innings",
+        "innings_id, match_id, innings_number, innings_order, innings_name, "
+        "batting_team_id, batting_team, bowling_team_id, bowling_team, "
+        "close_type, declared, runs, wickets, overs, extras, byes, leg_byes, "
+        "wides, no_balls, penalties",
         order_col="match_id",
     )
 
@@ -300,6 +321,43 @@ def get_deliveries_for_batters(batter_ids: tuple[str, ...]):
 
 
 @st.cache_data(ttl=300)
+def get_deliveries_for_match(match_id: str):
+    """
+    All deliveries for a single match -- a cheap point-lookup (the
+    deliveries_match_innings_idx index covers exactly this), typically a
+    few hundred rows for a whole match. Powers the entire Match Summary
+    tab (batting singles/dot-ball counts, bowling ball-by-ball detail,
+    5-dot-over calculation) from ONE fetch instead of one query per player.
+    """
+    pages = []
+    start = 0
+    page_size = 1000
+
+    while True:
+        sql = """
+            SELECT * FROM deliveries
+            WHERE match_id = :match_id
+            ORDER BY innings_id, over, ball_number
+            LIMIT :limit OFFSET :offset
+        """
+        df_page = _query_with_retry(
+            sql,
+            params={"match_id": match_id, "limit": page_size, "offset": start},
+            ttl=0,
+        )
+        if df_page.empty:
+            break
+        pages.append(df_page)
+        if len(df_page) < page_size:
+            break
+        start += page_size
+
+    if not pages:
+        return pd.DataFrame()
+    return _stringify_uuids(pd.concat(pages, ignore_index=True))
+
+
+@st.cache_data(ttl=300)
 def get_highlights():
     """Highlight clips (fours, sixes, dismissals, etc.) with video URLs."""
     return fetch_all_rows("highlights", "*")
@@ -346,8 +404,7 @@ def get_bowling_conceded_summary():
     Fours/sixes are identified by batter_runs = 4 / 6 (i.e. runs actually
     scored off the bat on that delivery) -- NOT by parsing the free-text
     `description` column, which doesn't reliably contain the words
-    "FOUR"/"SIX" and was previously causing every boundary-rate figure on
-    the Bowling tab to read as zero.
+    "FOUR"/"SIX".
 
     runs conceded uses deliveries.bowler_runs where populated (the ball's
     true bowler-attributed runs, including wide/no-ball penalty runs but
