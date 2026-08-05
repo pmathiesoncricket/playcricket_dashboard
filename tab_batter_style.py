@@ -17,6 +17,14 @@ from db import (
 # instead of the tagged bowler.
 
 BATTER_HAND_OPTIONS = ["Right", "Left"]
+# Explicit placeholder for "no value" -- always sorted/inserted at index 0,
+# so a genuinely blank/NULL batter_hand renders as blank in the dropdown
+# instead of silently landing on whichever real option is alphabetically
+# first ("Left" before "Right"). Without this, saving a page you hadn't
+# touched could actually WRITE "Left" over every NULL row, since the
+# selectbox always has some option selected and there was no way to tell
+# "still blank" apart from "explicitly chose the first option".
+BLANK_OPTION = "\u2014"
 ROW_DIVIDER = "<hr style='margin:2px 0;border:none;border-top:1px solid #333'>"
 MAX_HIGHLIGHTS = 10
 BATTERS_PER_PAGE = 20
@@ -93,7 +101,10 @@ def batter_style_tab():
 
     st.caption(f"{total_batters} batters \u2014 page {current_page + 1} of {total_pages} (showing {len(page_df)})")
 
-    batter_hand_opts = sorted(set(BATTER_HAND_OPTIONS) | set(style_df["batter_hand"].dropna().unique().tolist()))
+    # BLANK_OPTION is always first -- represents "no value" / NULL.
+    batter_hand_opts = [BLANK_OPTION] + sorted(
+        set(BATTER_HAND_OPTIONS) | set(style_df["batter_hand"].dropna().unique().tolist())
+    )
 
     page_batter_ids = page_df["batter_id"].tolist()
     page_batter_ids_str = tuple(str(x) for x in page_batter_ids)
@@ -102,6 +113,9 @@ def batter_style_tab():
         st.session_state["selected_batter_id"] = page_df.iloc[0]["batter_id"]
 
     def dropdown_index(options, current_value):
+        """Index of `current_value` in `options`, or 0 (BLANK_OPTION) if the
+        value is missing/None/NaN -- i.e. genuinely unpopulated stays blank
+        rather than defaulting to whichever real option sorts first."""
         if pd.notna(current_value) and current_value in options:
             return options.index(current_value)
         return 0
@@ -111,7 +125,7 @@ def batter_style_tab():
         for _, row in df.iterrows():
             bid = row["batter_id"]
             hand_val = st.session_state.get(f"bhand_{bid}")
-            new_batter_hand = None if not hand_val else hand_val
+            new_batter_hand = None if (not hand_val or hand_val == BLANK_OPTION) else hand_val
             orig_batter_hand = row.get("batter_hand") if pd.notna(row.get("batter_hand")) else None
             if new_batter_hand != orig_batter_hand:
                 changed.append({
