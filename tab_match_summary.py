@@ -1,3 +1,16 @@
+import re
+import streamlit as st
+import pandas as pd
+
+from db import get_matches, get_innings, get_batting_innings, get_bowling_innings, get_deliveries_for_match
+from helpers import add_season_column, cascading_multiselect
+# Reuse the overs<->balls conversion and the bowling-metric prep helpers
+# already ironed out on the Bowling tab, rather than re-deriving them.
+from tab_bowling import overs_to_balls, _prep_bowling_deliveries
+
+DASH = "-"
+
+
 def _fmt(x, dp=2):
     return f"{x:.{dp}f}" if pd.notna(x) else DASH
 
@@ -72,8 +85,10 @@ def match_summary_tab():
     matches_df = add_season_column(matches_df, "day_1_start")
 
     st.markdown("#### Filters")
-    st.caption("Filters are interdependent \u2014 each one narrows the options below it. "
-               "These filters apply only to this page.")
+    st.caption(
+        "Filters are interdependent -- each one narrows the options below it. "
+        "These filters apply only to this page."
+    )
 
     stage_matches = matches_df.copy()
 
@@ -87,7 +102,7 @@ def match_summary_tab():
     season_options = (
         stage_matches["season"].dropna().drop_duplicates().sort_values(ascending=False).tolist()
     )
-    selected_season = cascading_multiselect(row1_col2, "Season (July\u2013June)", season_options, "ms_filter_season")
+    selected_season = cascading_multiselect(row1_col2, "Season (July-June)", season_options, "ms_filter_season")
     if selected_season:
         stage_matches = stage_matches[stage_matches["season"].isin(selected_season)]
 
@@ -111,14 +126,15 @@ def match_summary_tab():
     team_options = sorted(
         pd.concat([stage_matches["home_team"], stage_matches["away_team"]]).dropna().unique().tolist()
     )
+    team_placeholder = "-- select --"
     if "ms_filter_team" in st.session_state and st.session_state["ms_filter_team"] not in (
-        ["\u2014 select \u2014"] + team_options
+        [team_placeholder] + team_options
     ):
-        st.session_state["ms_filter_team"] = "\u2014 select \u2014"
+        st.session_state["ms_filter_team"] = team_placeholder
     selected_team = row2_col1.selectbox(
-        "Team", ["\u2014 select \u2014"] + team_options, key="ms_filter_team"
+        "Team", [team_placeholder] + team_options, key="ms_filter_team"
     )
-    if selected_team == "\u2014 select \u2014":
+    if selected_team == team_placeholder:
         st.info("Select a team above to continue.")
         return
 
@@ -189,8 +205,8 @@ def _render_match_report(match_id, selected_team, opponent_name, match_row):
     grade = match_row.get("grade") or ""
     vs_prefix = f"{round_short} vs" if round_short else "vs"
 
-    st.subheader(f"{selected_team} \u2014 {vs_prefix} {opponent_name} ({venue}, {grade})")
-    st.caption(f"{match_row.get('match_type', '')} \u2014 {match_row.get('result_text') or 'Result unavailable'}")
+    st.subheader(f"{selected_team} -- {vs_prefix} {opponent_name} ({venue}, {grade})")
+    st.caption(f"{match_row.get('match_type', '')} -- {match_row.get('result_text') or 'Result unavailable'}")
 
     if innings_df.empty:
         st.info("No innings-level data recorded for this match.")
@@ -200,7 +216,7 @@ def _render_match_report(match_id, selected_team, opponent_name, match_row):
             st.markdown(f"- {_innings_summary_line(inn)}")
 
     if deliveries_df.empty:
-        st.warning("No ball-by-ball data available for this match \u2014 some detail below will be limited or skipped.")
+        st.warning("No ball-by-ball data available for this match -- some detail below will be limited or skipped.")
 
     st.divider()
 
@@ -221,7 +237,7 @@ def _render_match_report(match_id, selected_team, opponent_name, match_row):
     st.markdown("### Notes")
     st.caption(
         "- Team totals in the batting table are the sum of individual batting figures; the official "
-        "innings total (score summary above) may be higher \u2014 the difference is extras (byes, leg "
+        "innings total (score summary above) may be higher -- the difference is extras (byes, leg "
         "byes, wides, no-balls, penalties) not attributed to a specific batter.\n"
         "- Bowling figures (O, M, R, W, Econ, Wd, NB) are sourced directly from the official scorecard "
         "(player_innings).\n"
@@ -238,7 +254,7 @@ def _render_match_report(match_id, selected_team, opponent_name, match_row):
 def _render_batting_innings(inn_row, match_batting, deliveries_df, selected_team, vs_prefix, opponent_name, venue, grade):
     innings_id = inn_row["innings_id"]
     label = _innings_score_label(inn_row)
-    st.subheader(f"{selected_team} Batting \u2014 {vs_prefix} {opponent_name} ({venue}, {grade}) \u2014 Innings: {label}")
+    st.subheader(f"{selected_team} Batting -- {vs_prefix} {opponent_name} ({venue}, {grade}) -- Innings: {label}")
 
     bat_rows = match_batting[match_batting["innings_id"] == innings_id].copy()
     if bat_rows.empty:
@@ -326,7 +342,7 @@ def _render_batting_innings(inn_row, match_batting, deliveries_df, selected_team
 def _render_bowling_innings(inn_row, match_bowling, deliveries_df, selected_team):
     innings_id = inn_row["innings_id"]
     label = _innings_score_label(inn_row)
-    st.subheader(f"{selected_team} Bowling \u2014 vs {inn_row.get('batting_team', 'Unknown')} \u2014 Innings: {label}")
+    st.subheader(f"{selected_team} Bowling -- vs {inn_row.get('batting_team', 'Unknown')} -- Innings: {label}")
 
     bowl_rows = match_bowling[match_bowling["innings_id"] == innings_id].copy()
     if bowl_rows.empty:
@@ -382,7 +398,7 @@ def _render_bowling_innings(inn_row, match_bowling, deliveries_df, selected_team
 
     # ---- Extrapolated ball-by-ball detail ----
     if inn_deliveries.empty:
-        st.info("No ball-by-ball data available for this innings \u2014 extrapolated detail skipped.")
+        st.info("No ball-by-ball data available for this innings -- extrapolated detail skipped.")
         return
 
     prepped = _prep_bowling_deliveries(inn_deliveries)
