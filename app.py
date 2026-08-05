@@ -10,17 +10,33 @@ from tab_team import team_tab
 st.set_page_config(page_title="PlayCricket Dashboard", layout="wide")
 st.title("PlayCricket Dashboard")
 
-tabs = st.tabs(["Batting", "Batting Season Report", "Bowling", "Bowler Style", "Match Summary", "Team"])
+# NOTE: st.tabs() runs the code inside EVERY `with tabs[i]:` block on every
+# rerun, regardless of which tab is actually visible -- so with the old
+# tabs-based layout, batting_tab() (and every other tab's DB queries) fired
+# on every single page load/interaction, even if you were looking at a
+# different tab. Using a sidebar radio "page selector" instead means only
+# the currently-selected page's function ever actually executes, and
+# nothing loads at all until a page other than Home is chosen.
+PAGES = {
+    "Home": None,
+    "Batting": batting_tab,
+    "Batting Season Report": batting_season_tab,
+    "Bowling": bowling_tab,
+    "Bowler Style": bowler_style_tab,
+    "Match Summary": match_summary_tab,
+    "Team": team_tab,
+}
 
-with tabs[0]:
-    batting_tab()
-with tabs[1]:
-    batting_season_tab()
-with tabs[2]:
-    bowling_tab()
-with tabs[3]:
-    bowler_style_tab()
-with tabs[4]:
-    match_summary_tab()
-with tabs[5]:
-    team_tab()
+st.sidebar.markdown("### Navigation")
+selected_page = st.sidebar.radio("Go to", list(PAGES.keys()), key="nav_page")
+
+if selected_page == "Home":
+    st.header("Welcome")
+    st.markdown(
+        "Pick a report from the **Navigation** list in the sidebar to get started.\n\n"
+        "Nothing is loaded from the database on this landing page \u2014 each report "
+        "only queries data once you actually select it, to keep the app responsive."
+    )
+else:
+    page_fn = PAGES[selected_page]
+    page_fn()
