@@ -17,13 +17,6 @@ from db import (
 # instead of the tagged bowler.
 
 BATTER_HAND_OPTIONS = ["Right", "Left"]
-# Explicit placeholder for "no value" -- always sorted/inserted at index 0,
-# so a genuinely blank/NULL batter_hand renders as blank in the dropdown
-# instead of silently landing on whichever real option is alphabetically
-# first ("Left" before "Right"). Without this, saving a page you hadn't
-# touched could actually WRITE "Left" over every NULL row, since the
-# selectbox always has some option selected and there was no way to tell
-# "still blank" apart from "explicitly chose the first option".
 BLANK_OPTION = "\u2014"
 ROW_DIVIDER = "<hr style='margin:2px 0;border:none;border-top:1px solid #333'>"
 MAX_HIGHLIGHTS = 10
@@ -101,7 +94,6 @@ def batter_style_tab():
 
     st.caption(f"{total_batters} batters \u2014 page {current_page + 1} of {total_pages} (showing {len(page_df)})")
 
-    # BLANK_OPTION is always first -- represents "no value" / NULL.
     batter_hand_opts = [BLANK_OPTION] + sorted(
         set(BATTER_HAND_OPTIONS) | set(style_df["batter_hand"].dropna().unique().tolist())
     )
@@ -113,9 +105,6 @@ def batter_style_tab():
         st.session_state["selected_batter_id"] = page_df.iloc[0]["batter_id"]
 
     def dropdown_index(options, current_value):
-        """Index of `current_value` in `options`, or 0 (BLANK_OPTION) if the
-        value is missing/None/NaN -- i.e. genuinely unpopulated stays blank
-        rather than defaulting to whichever real option sorts first."""
         if pd.notna(current_value) and current_value in options:
             return options.index(current_value)
         return 0
@@ -131,10 +120,6 @@ def batter_style_tab():
                 changed.append({
                     "player_id": str(bid),
                     "batter_hand": new_batter_hand,
-                    # This tab only edits batter_hand, but player_style also
-                    # holds bowling-side fields for players who bowl too --
-                    # round-trip whatever they already have so the UPSERT
-                    # below doesn't null out someone's existing bowling style.
                     "pace_spin": row.get("pace_spin") if pd.notna(row.get("pace_spin")) else None,
                     "bowl_hand": row.get("bowl_hand") if pd.notna(row.get("bowl_hand")) else None,
                     "bowl_style": row.get("bowl_style") if pd.notna(row.get("bowl_style")) else None,
@@ -176,21 +161,56 @@ def batter_style_tab():
     list_col, highlight_col = st.columns([2, 3])
 
     with list_col:
-        nav1, nav2, nav3 = st.columns([1, 1, 2])
-        with nav1:
-            prev_page_clicked = st.button(
-                "< Prev page", disabled=current_page == 0, use_container_width=True, key="batter_prev_page_btn"
-            )
-        with nav2:
-            next_page_clicked = st.button(
-                "Next page >", disabled=current_page == total_pages - 1, use_container_width=True,
-                key="batter_next_page_btn",
-            )
-        with nav3:
-            save_all_clicked = st.button(
-                "Save page changes", type="primary", use_container_width=True, key="save_all_batter_styles"
-            )
+        # FIX: every button that needs to see the latest dropdown edits --
+        # including Prev/Next/Save -- must be an st.form_submit_button
+        # INSIDE this same form. Streamlit only syncs a form's widgets into
+        # st.session_state when one of ITS OWN submit buttons is clicked;
+        # a plain st.button() outside the form triggers a rerun without
+        # pulling in any pending edits from inside it. That mismatch was
+        # exactly why the last-touched dropdown wouldn't save unless you
+        # clicked "Show highlights" (a submit button) on some other row
+        # first -- that click happened to sync everything, a direct
+        # Prev/Next/Save click didn't.
+        with st.form("batter_styles_form", clear_on_submit=False):
+            nav1, nav2, nav3 = st.columns([1, 1, 2])
+            with nav1:
+                prev_page_clicked = st.form_submit_button(
+                    "< Prev page", disabled=current_page == 0, use_container_width=True,
+                )
+            with nav2:
+                next_page_clicked = st.form_submit_button(
+                    "Next page >", disabled=current_page == total_pages - 1, use_container_width=True,
+                )
+            with nav3:
+                save_all_clicked = st.form_submit_button(
+                    "Save page changes", type="primary", use_container_width=True,
+                )
 
+            show_hl_clicks = {}
+            with st.container(height=PANEL_HEIGHT):
+                for _, row in page_df.iterrows():
+                    bid = row["batter_id"]
+                    is_selected = bid == st.session_state["selected_batter_id"]
+                    selected_marker = " (current)" if is_selected else ""
+                    st.markdown(f"**{row['batter_name']}** ({row['balls']} balls){selected_marker}")
+
+                    chand, cselect = st.columns([1, 1])
+                    with chand:
+                        st.selectbox(
+                            "Hand", batter_hand_opts,
+                            index=dropdown_index(batter_hand_opts, row.get("batter_hand")),
+                            key=f"bhand_{bid}", label_visibility="collapsed",
+                        )
+                    with cselect:
+                        show_hl_clicks[bid] = st.form_submit_button(
+                            "Show highlights", key=f"show_hl_{bid}",
+                            help="Show highlights", use_container_width=True,
+                        )
+                    st.markdown(ROW_DIVIDER, unsafe_allow_html=True)
+
+        # Everything below runs AFTER the form block closes, so by this
+        # point st.session_state has the fully up-to-date value of every
+        # dropdown regardless of which button was clicked.
         if prev_page_clicked:
             try:
                 saved_count = save_changed_rows(page_df)
@@ -226,30 +246,11 @@ def batter_style_tab():
             except Exception as e:
                 st.error(f"Bulk save failed: {e}")
 
-        with st.form("batter_styles_form", clear_on_submit=False):
-            with st.container(height=PANEL_HEIGHT):
-                for _, row in page_df.iterrows():
-                    bid = row["batter_id"]
-                    is_selected = bid == st.session_state["selected_batter_id"]
-                    selected_marker = " (current)" if is_selected else ""
-                    st.markdown(f"**{row['batter_name']}** ({row['balls']} balls){selected_marker}")
-
-                    chand, cselect = st.columns([1, 1])
-                    with chand:
-                        st.selectbox(
-                            "Hand", batter_hand_opts,
-                            index=dropdown_index(batter_hand_opts, row.get("batter_hand")),
-                            key=f"bhand_{bid}", label_visibility="collapsed",
-                        )
-                    with cselect:
-                        if st.form_submit_button(
-                            "Show highlights", key=f"show_hl_{bid}",
-                            help="Show highlights", use_container_width=True,
-                        ):
-                            st.session_state["selected_batter_id"] = bid
-                            st.session_state.pop("selected_batter_highlight_id", None)
-                            st.rerun()
-                    st.markdown(ROW_DIVIDER, unsafe_allow_html=True)
+        clicked_batter_id = next((bid for bid, clicked in show_hl_clicks.items() if clicked), None)
+        if clicked_batter_id is not None:
+            st.session_state["selected_batter_id"] = clicked_batter_id
+            st.session_state.pop("selected_batter_highlight_id", None)
+            st.rerun()
 
     with highlight_col:
         selected_row = page_df[page_df["batter_id"] == st.session_state["selected_batter_id"]]
