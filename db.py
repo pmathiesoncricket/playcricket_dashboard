@@ -108,12 +108,6 @@ def get_matches():
 
 @st.cache_data(ttl=300)
 def get_innings():
-    """
-    Full `innings` table -- one row per innings with the OFFICIAL runs,
-    wickets, overs and extras breakdown (byes/leg byes/wides/no-balls/
-    penalties). This is the only place total innings extras exist; the
-    per-player batting/bowling figures in player_innings don't carry them.
-    """
     return fetch_all_rows(
         "innings",
         "innings_id, match_id, innings_number, innings_order, innings_name, "
@@ -126,10 +120,6 @@ def get_innings():
 
 @st.cache_data(ttl=300)
 def get_batting_innings():
-    """
-    player_innings for role='batting', joined to matches for grade/match_type/date/opponent,
-    and joined to player_style for bowling type (pace_spin) and bowling style (bowl_style).
-    """
     pi_df = fetch_all_rows("player_innings", "*", eq_filters={"role": "batting"})
 
     m_df = get_matches()
@@ -152,10 +142,6 @@ def get_batting_innings():
 
 @st.cache_data(ttl=300)
 def get_bowling_innings():
-    """
-    player_innings for role='bowling', joined to matches for grade/match_type/date/opponent,
-    and joined to player_style for the BOWLER'S OWN batting hand / pace_spin / bowl_style.
-    """
     pi_df = fetch_all_rows("player_innings", "*", eq_filters={"role": "bowling"})
 
     m_df = get_matches()
@@ -276,8 +262,6 @@ def get_deliveries_for_batters(batter_ids: tuple[str, ...]):
 
 @st.cache_data(ttl=300)
 def get_deliveries_for_match(match_id: str):
-    """All deliveries for a single match -- cheap point-lookup, used by the
-    single-match Match Summary detail view."""
     pages = []
     start = 0
     page_size = 1000
@@ -308,12 +292,6 @@ def get_deliveries_for_match(match_id: str):
 
 @st.cache_data(ttl=300)
 def get_deliveries_for_matches(match_ids: tuple[str, ...]):
-    """
-    Bulk fetch of deliveries for a SET of matches in one query, mirroring
-    get_deliveries_for_batters()/get_deliveries_for_bowler() -- powers the
-    Match Summary tab's multi-match aggregate view (batting singles/dots,
-    aggregated bowling ball-by-ball detail) without one query per match.
-    """
     if not match_ids:
         return pd.DataFrame()
 
@@ -422,34 +400,65 @@ def get_wicket_deliveries():
 
 @st.cache_data(ttl=300)
 def get_highlights_for_bowlers(bowler_ids: tuple[str, ...], max_per_bowler: int = 10):
+    """
+    Up to `max_per_bowler` highlights per bowler, spread across as many
+    DIFFERENT MATCHES as possible: takes each bowler's first (earliest,
+    within-match) highlight from every distinct match they appear in
+    (most recent match first) before taking a second highlight from any
+    match -- i.e. 1 clip each from up to `max_per_bowler` different
+    matches, or 2 each if only half that many matches are available, etc.
+    This matters because video/stream quality varies match to match, so a
+    spread of matches gives a much better read on a bowler's action than
+    10 clips that all happen to come from the same one or two games.
+    """
     if not bowler_ids:
         return pd.DataFrame()
 
     params = {"max_per_bowler": max_per_bowler}
     placeholders = []
-
     for i, bid in enumerate(bowler_ids):
         key = f"bid_{i}"
         placeholders.append(f":{key}")
         params[key] = bid
-
     in_sql = ", ".join(placeholders)
 
     sql = f"""
-        WITH ranked AS (
+        WITH per_match_ranked AS (
             SELECT
-                h.*,
+                h.highlight_id, h.match_id, h.innings_id, h.innings_number, h.innings_order,
+                h.ball_id, h.over, h.ball_number, h.batter_id, h.batter, h.bowler_id, h.bowler,
+                h.highlight_type, h.metrics, h.description, h.highlight_url,
+                h.created_at, h.updated_at,
                 ROW_NUMBER() OVER (
+                    PARTITION BY h.bowler_id, h.match_id
+                    ORDER BY h.innings_number, h.over, h.ball_number
+                ) AS rank_within_match,
+                DENSE_RANK() OVER (
                     PARTITION BY h.bowler_id
-                    ORDER BY h.match_id DESC, h.innings_number, h.over, h.ball_number
-                ) AS rn
+                    ORDER BY m.day_1_start DESC NULLS LAST, h.match_id DESC
+                ) AS match_recency_rank
             FROM highlights h
+            LEFT JOIN matches m ON m.match_id = h.match_id
             WHERE h.bowler_id IN ({in_sql})
+        ),
+        final_ranked AS (
+            SELECT
+                highlight_id, match_id, innings_id, innings_number, innings_order,
+                ball_id, over, ball_number, batter_id, batter, bowler_id, bowler,
+                highlight_type, metrics, description, highlight_url, created_at, updated_at,
+                ROW_NUMBER() OVER (
+                    PARTITION BY bowler_id
+                    ORDER BY rank_within_match ASC, match_recency_rank ASC
+                ) AS overall_rank
+            FROM per_match_ranked
         )
-        SELECT *
-        FROM ranked
-        WHERE rn <= :max_per_bowler
-        ORDER BY bowler_id, rn
+        SELECT
+            highlight_id, match_id, innings_id, innings_number, innings_order,
+            ball_id, over, ball_number, batter_id, batter, bowler_id, bowler,
+            highlight_type, metrics, description, highlight_url, created_at, updated_at
+        FROM final_ranked
+        WHERE overall_rank <= :max_per_bowler
+        ORDER BY bowler_id, overall_rank
     """
 
     df = _query_with_retry(sql, params=params, ttl=0)
@@ -458,34 +467,61 @@ def get_highlights_for_bowlers(bowler_ids: tuple[str, ...], max_per_bowler: int 
 
 @st.cache_data(ttl=300)
 def get_highlights_for_batters(batter_ids: tuple[str, ...], max_per_batter: int = 10):
+    """
+    Up to `max_per_batter` highlights per batter, spread across as many
+    DIFFERENT MATCHES as possible -- mirrors get_highlights_for_bowlers()
+    exactly, just partitioned by batter_id instead. See that function's
+    docstring for why match-spread (rather than "10 most recent clips
+    regardless of match") matters here.
+    """
     if not batter_ids:
         return pd.DataFrame()
 
     params = {"max_per_batter": max_per_batter}
     placeholders = []
-
     for i, bid in enumerate(batter_ids):
         key = f"bid_{i}"
         placeholders.append(f":{key}")
         params[key] = bid
-
     in_sql = ", ".join(placeholders)
 
     sql = f"""
-        WITH ranked AS (
+        WITH per_match_ranked AS (
             SELECT
-                h.*,
+                h.highlight_id, h.match_id, h.innings_id, h.innings_number, h.innings_order,
+                h.ball_id, h.over, h.ball_number, h.batter_id, h.batter, h.bowler_id, h.bowler,
+                h.highlight_type, h.metrics, h.description, h.highlight_url,
+                h.created_at, h.updated_at,
                 ROW_NUMBER() OVER (
+                    PARTITION BY h.batter_id, h.match_id
+                    ORDER BY h.innings_number, h.over, h.ball_number
+                ) AS rank_within_match,
+                DENSE_RANK() OVER (
                     PARTITION BY h.batter_id
-                    ORDER BY h.match_id DESC, h.innings_number, h.over, h.ball_number
-                ) AS rn
+                    ORDER BY m.day_1_start DESC NULLS LAST, h.match_id DESC
+                ) AS match_recency_rank
             FROM highlights h
+            LEFT JOIN matches m ON m.match_id = h.match_id
             WHERE h.batter_id IN ({in_sql})
+        ),
+        final_ranked AS (
+            SELECT
+                highlight_id, match_id, innings_id, innings_number, innings_order,
+                ball_id, over, ball_number, batter_id, batter, bowler_id, bowler,
+                highlight_type, metrics, description, highlight_url, created_at, updated_at,
+                ROW_NUMBER() OVER (
+                    PARTITION BY batter_id
+                    ORDER BY rank_within_match ASC, match_recency_rank ASC
+                ) AS overall_rank
+            FROM per_match_ranked
         )
-        SELECT *
-        FROM ranked
-        WHERE rn <= :max_per_batter
-        ORDER BY batter_id, rn
+        SELECT
+            highlight_id, match_id, innings_id, innings_number, innings_order,
+            ball_id, over, ball_number, batter_id, batter, bowler_id, bowler,
+            highlight_type, metrics, description, highlight_url, created_at, updated_at
+        FROM final_ranked
+        WHERE overall_rank <= :max_per_batter
+        ORDER BY batter_id, overall_rank
     """
 
     df = _query_with_retry(sql, params=params, ttl=0)
