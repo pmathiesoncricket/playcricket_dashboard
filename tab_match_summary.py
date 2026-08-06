@@ -2,10 +2,11 @@ import re
 import streamlit as st
 import pandas as pd
 
-from db import get_matches, get_innings, get_batting_innings, get_bowling_innings, get_deliveries_for_match
+from db import (
+    get_matches, get_innings, get_batting_innings, get_bowling_innings,
+    get_deliveries_for_match, get_deliveries_for_matches,
+)
 from helpers import add_season_column, cascading_multiselect
-# Reuse the overs<->balls conversion and the bowling-metric prep helpers
-# already ironed out on the Bowling tab, rather than re-deriving them.
 from tab_bowling import overs_to_balls, _prep_bowling_deliveries
 
 DASH = "-"
@@ -75,6 +76,20 @@ def _innings_summary_line(row):
     return f"**{row.get('batting_team', 'Unknown')}** {_innings_score_label(row)} ({overs_str} overs, RR {rr_str})"
 
 
+def _opponent_of(row, our_teams):
+    """Given a match row and the set of name-variants that count as "us",
+    returns whichever side is NOT us. Lets Team be multi-selected to cover
+    a club renaming itself across seasons (e.g. 'Omega CC 1st XI' vs
+    'Omega 1') while still resolving a single, correct opponent per match."""
+    home = row.get("home_team")
+    away = row.get("away_team")
+    if home in our_teams:
+        return away
+    if away in our_teams:
+        return home
+    return None
+
+
 def match_summary_tab():
     st.header("Match Summary")
 
@@ -120,48 +135,33 @@ def match_summary_tab():
 
     row2_col1, row2_col2, row2_col3 = st.columns(3)
 
-    # ---- Team (single-select; drives BOTH the batting and bowling sides
-    # of the report, since the whole page is "one team's match", mirroring
-    # the screenshot). ----
+    # ---- Team (multi-select; drives BOTH the batting and bowling sides of
+    # the report). Select every name-variant your club has used across
+    # seasons (e.g. "Omega CC 1st XI" and "Omega 1") -- they're all treated
+    # as the same side for filtering and for resolving the opponent below. ----
     team_options = sorted(
         pd.concat([stage_matches["home_team"], stage_matches["away_team"]]).dropna().unique().tolist()
     )
-    team_placeholder = "-- select --"
-    if "ms_filter_team" in st.session_state and st.session_state["ms_filter_team"] not in (
-        [team_placeholder] + team_options
-    ):
-        st.session_state["ms_filter_team"] = team_placeholder
-    selected_team = row2_col1.selectbox(
-        "Team", [team_placeholder] + team_options, key="ms_filter_team"
+    selected_teams = cascading_multiselect(
+        row2_col1, "Team (select all name variants used across seasons)", team_options, "ms_filter_team"
     )
-    if selected_team == team_placeholder:
-        st.info("Select a team above to continue.")
+    if not selected_teams:
+        st.info("Select at least one team above to continue.")
         return
 
+    our_teams = set(selected_teams)
     team_matches = stage_matches[
-        (stage_matches["home_team"] == selected_team) | (stage_matches["away_team"] == selected_team)
+        stage_matches["home_team"].isin(our_teams) | stage_matches["away_team"].isin(our_teams)
     ].copy()
+    team_matches["opponent_team"] = team_matches.apply(lambda r: _opponent_of(r, our_teams), axis=1)
 
-    # ---- Opposition (single-select; also narrows both sides of the report
-    # by narrowing which matches are eligible). ----
-    opponent_options = sorted(
-        pd.concat([
-            team_matches.loc[team_matches["home_team"] == selected_team, "away_team"],
-            team_matches.loc[team_matches["away_team"] == selected_team, "home_team"],
-        ]).dropna().unique().tolist()
-    )
-    if "ms_filter_opponent" in st.session_state and st.session_state["ms_filter_opponent"] not in (
-        ["All opponents"] + opponent_options
-    ):
-        st.session_state["ms_filter_opponent"] = "All opponents"
+    # ---- Opposition (single-select; narrows which matches are eligible). ----
+    opponent_options = sorted(team_matches["opponent_team"].dropna().unique().tolist())
     selected_opponent = row2_col2.selectbox(
         "Opposition", ["All opponents"] + opponent_options, key="ms_filter_opponent"
     )
     if selected_opponent != "All opponents":
-        team_matches = team_matches[
-            ((team_matches["home_team"] == selected_team) & (team_matches["away_team"] == selected_opponent))
-            | ((team_matches["away_team"] == selected_team) & (team_matches["home_team"] == selected_opponent))
-        ]
+        team_matches = team_matches[team_matches["opponent_team"] == selected_opponent]
 
     if team_matches.empty:
         st.warning("No matches found for this team/opposition combination.")
@@ -171,21 +171,39 @@ def match_summary_tab():
     team_matches["match_label"] = team_matches.apply(_match_label, axis=1)
     team_matches = team_matches.sort_values("day_1_start", ascending=False)
 
+    # ---- Match (multi-select; empty = "All matches matching the filters
+    # above". One match selected -> full match-level detail. More than one
+    # (including "All") -> aggregated totals across every selected match. ----
     match_options = team_matches["match_label"].tolist()
-    if "ms_filter_match" in st.session_state and st.session_state["ms_filter_match"] not in match_options:
-        st.session_state.pop("ms_filter_match", None)
+    selected_match_labels = cascading_multiselect(
+        row2_col3, "Match (leave empty for All)", match_options, "ms_filter_match"
+    )
 
-    selected_match_label = row2_col3.selectbox("Match", match_options, key="ms_filter_match")
-    match_row = team_matches[team_matches["match_label"] == selected_match_label].iloc[0]
-    match_id = match_row["match_id"]
-    opponent_name = match_row["away_team"] if match_row["home_team"] == selected_team else match_row["home_team"]
+    if selected_match_labels:
+        selected_matches_df = team_matches[team_matches["match_label"].isin(selected_match_labels)].copy()
+    else:
+        selected_matches_df = team_matches.copy()
+
+    if selected_matches_df.empty:
+        st.warning("No matches match the current selection.")
+        return
 
     st.divider()
 
-    _render_match_report(match_id, selected_team, opponent_name, match_row)
+    if len(selected_matches_df) == 1:
+        match_row = selected_matches_df.iloc[0]
+        match_id = match_row["match_id"]
+        opponent_name = match_row["opponent_team"]
+        _render_match_report(match_id, selected_teams, opponent_name, match_row)
+    else:
+        _render_aggregate_report(selected_matches_df, selected_teams, selected_opponent)
 
 
-def _render_match_report(match_id, selected_team, opponent_name, match_row):
+# =========================================================================
+# Single-match detail view (one specific match selected)
+# =========================================================================
+
+def _render_match_report(match_id, selected_teams, opponent_name, match_row):
     innings_df = get_innings()
     innings_df = innings_df[innings_df["match_id"] == match_id].sort_values("innings_order")
 
@@ -194,19 +212,28 @@ def _render_match_report(match_id, selected_team, opponent_name, match_row):
     deliveries_df = get_deliveries_for_match(str(match_id))
 
     match_batting = batting_all[
-        (batting_all["match_id"] == match_id) & (batting_all["team"] == selected_team)
+        (batting_all["match_id"] == match_id) & (batting_all["team"].isin(selected_teams))
     ].copy()
     match_bowling = bowling_all[
-        (bowling_all["match_id"] == match_id) & (bowling_all["team"] == selected_team)
+        (bowling_all["match_id"] == match_id) & (bowling_all["team"].isin(selected_teams))
     ].copy()
+
+    # Use whichever selected team-name-variant is actually recorded against
+    # THIS match (not just the first alias in the list) for display.
+    if not match_batting.empty:
+        team_label = match_batting["team"].iloc[0]
+    elif not match_bowling.empty:
+        team_label = match_bowling["team"].iloc[0]
+    else:
+        team_label = " / ".join(selected_teams)
 
     round_short = _short_round(match_row.get("round"))
     venue = match_row.get("venue") or match_row.get("ground") or "Unknown venue"
     grade = match_row.get("grade") or ""
     vs_prefix = f"{round_short} vs" if round_short else "vs"
 
-    st.subheader(f"{selected_team} -- {vs_prefix} {opponent_name} ({venue}, {grade})")
-    st.caption(f"{match_row.get('match_type', '')} -- {match_row.get('result_text') or 'Result unavailable'}")
+    st.subheader(f"{team_label} \u2014 {vs_prefix} {opponent_name} ({venue}, {grade})")
+    st.caption(f"{match_row.get('match_type', '')} \u2014 {match_row.get('result_text') or 'Result unavailable'}")
 
     if innings_df.empty:
         st.info("No innings-level data recorded for this match.")
@@ -220,18 +247,18 @@ def _render_match_report(match_id, selected_team, opponent_name, match_row):
 
     st.divider()
 
-    our_batting_innings = innings_df[innings_df["batting_team"] == selected_team]
+    our_batting_innings = innings_df[innings_df["batting_team"] == team_label]
     if our_batting_innings.empty:
-        st.info(f"No batting innings recorded for {selected_team} in this match.")
+        st.info(f"No batting innings recorded for {team_label} in this match.")
     for _, inn_row in our_batting_innings.iterrows():
-        _render_batting_innings(inn_row, match_batting, deliveries_df, selected_team, vs_prefix, opponent_name, venue, grade)
+        _render_batting_innings(inn_row, match_batting, deliveries_df, team_label, vs_prefix, opponent_name, venue, grade)
         st.divider()
 
-    our_bowling_innings = innings_df[innings_df["bowling_team"] == selected_team]
+    our_bowling_innings = innings_df[innings_df["bowling_team"] == team_label]
     if our_bowling_innings.empty:
-        st.info(f"No bowling innings recorded for {selected_team} in this match.")
+        st.info(f"No bowling innings recorded for {team_label} in this match.")
     for _, inn_row in our_bowling_innings.iterrows():
-        _render_bowling_innings(inn_row, match_bowling, deliveries_df, selected_team)
+        _render_bowling_innings(inn_row, match_bowling, deliveries_df, team_label)
         st.divider()
 
     st.markdown("### Notes")
@@ -251,10 +278,10 @@ def _render_match_report(match_id, selected_team, opponent_name, match_row):
     )
 
 
-def _render_batting_innings(inn_row, match_batting, deliveries_df, selected_team, vs_prefix, opponent_name, venue, grade):
+def _render_batting_innings(inn_row, match_batting, deliveries_df, team_label, vs_prefix, opponent_name, venue, grade):
     innings_id = inn_row["innings_id"]
     label = _innings_score_label(inn_row)
-    st.subheader(f"{selected_team} Batting -- {vs_prefix} {opponent_name} ({venue}, {grade}) -- Innings: {label}")
+    st.subheader(f"{team_label} Batting \u2014 {vs_prefix} {opponent_name} ({venue}, {grade}) \u2014 Innings: {label}")
 
     bat_rows = match_batting[match_batting["innings_id"] == innings_id].copy()
     if bat_rows.empty:
@@ -268,9 +295,6 @@ def _render_batting_innings(inn_row, match_batting, deliveries_df, selected_team
     if not deliveries_df.empty:
         inn_deliveries = deliveries_df[deliveries_df["innings_id"] == innings_id].copy()
         inn_deliveries["wides"] = inn_deliveries["wides"].fillna(0)
-        # A batter faces (and can score off) a no-ball, just not a wide --
-        # matches the "legal_ball = wides == 0" convention already used
-        # for batting stats elsewhere in this app.
         legal_for_batter = inn_deliveries[inn_deliveries["wides"] == 0]
         ball_stats = legal_for_batter.groupby("batter_id").agg(
             dot_balls=("batter_runs", lambda x: (x == 0).sum()),
@@ -339,10 +363,10 @@ def _render_batting_innings(inn_row, match_batting, deliveries_df, selected_team
         )
 
 
-def _render_bowling_innings(inn_row, match_bowling, deliveries_df, selected_team):
+def _render_bowling_innings(inn_row, match_bowling, deliveries_df, team_label):
     innings_id = inn_row["innings_id"]
     label = _innings_score_label(inn_row)
-    st.subheader(f"{selected_team} Bowling -- vs {inn_row.get('batting_team', 'Unknown')} -- Innings: {label}")
+    st.subheader(f"{team_label} Bowling \u2014 vs {inn_row.get('batting_team', 'Unknown')} \u2014 Innings: {label}")
 
     bowl_rows = match_bowling[match_bowling["innings_id"] == innings_id].copy()
     if bowl_rows.empty:
@@ -354,8 +378,6 @@ def _render_bowling_innings(inn_row, match_bowling, deliveries_df, selected_team
         if not deliveries_df.empty else pd.DataFrame()
     )
 
-    # Order both tables by first over bowled, so they read in the same
-    # chronological bowling order as the official scorecard.
     if not inn_deliveries.empty:
         first_over = (
             inn_deliveries.groupby("bowler_id")["over"].min()
@@ -366,7 +388,6 @@ def _render_bowling_innings(inn_row, match_bowling, deliveries_df, selected_team
         bowl_rows["first_over"] = None
     bowl_rows = bowl_rows.sort_values("first_over", na_position="last")
 
-    # ---- Official figures (from player_innings -- the source scorecard) ----
     official = bowl_rows[[
         "player_name", "overs", "maidens", "runs_conceded", "wickets_taken",
         "economy", "wides_bowled", "no_balls_bowled",
@@ -396,7 +417,6 @@ def _render_bowling_innings(inn_row, match_bowling, deliveries_df, selected_team
         width="stretch", hide_index=True,
     )
 
-    # ---- Extrapolated ball-by-ball detail ----
     if inn_deliveries.empty:
         st.info("No ball-by-ball data available for this innings -- extrapolated detail skipped.")
         return
@@ -423,8 +443,6 @@ def _render_bowling_innings(inn_row, match_bowling, deliveries_df, selected_team
         lambda r: 100 * r["balls_scored_from"] / r["legal_deliveries"] if r["legal_deliveries"] > 0 else None, axis=1,
     )
 
-    # 5-Dot Overs: legal deliveries only, grouped by bowler + over number --
-    # an over where 5 or 6 of the legal balls were dots.
     legal_only = prepped[prepped["is_legal"]]
     per_over = legal_only.groupby(["bowler_id", "over"]).agg(
         dots_in_over=("is_dot", "sum"),
@@ -473,4 +491,268 @@ def _render_bowling_innings(inn_row, match_bowling, deliveries_df, selected_team
             "five_dot_overs": "5-Dot Overs", "balls_scored_from": "Balls Scored From",
         }),
         width="stretch", hide_index=True,
+    )
+
+
+# =========================================================================
+# Aggregate view (2+ matches selected, or Match left as "All")
+# =========================================================================
+
+def _render_aggregate_report(selected_matches_df, selected_teams, selected_opponent):
+    match_ids = selected_matches_df["match_id"].tolist()
+    match_ids_str = tuple(str(m) for m in match_ids)
+    team_label = " / ".join(selected_teams)
+    opp_label = selected_opponent if selected_opponent != "All opponents" else "multiple opponents"
+
+    st.subheader(f"{team_label} \u2014 aggregate across {len(match_ids)} match(es) vs {opp_label}")
+    st.caption(
+        "More than one match is selected (or Match was left as All), so this shows totals summed "
+        "across every match below rather than a single scorecard. Select exactly one match above "
+        "for full per-innings detail, extras breakdown, and ball-by-ball video links."
+    )
+
+    batting_all = get_batting_innings()
+    bowling_all = get_bowling_innings()
+    deliveries_df = get_deliveries_for_matches(match_ids_str)
+
+    match_batting = batting_all[
+        batting_all["match_id"].isin(match_ids) & batting_all["team"].isin(selected_teams)
+    ].copy()
+    match_bowling = bowling_all[
+        bowling_all["match_id"].isin(match_ids) & bowling_all["team"].isin(selected_teams)
+    ].copy()
+
+    st.markdown("**Matches included**")
+    matches_list = selected_matches_df[["day_1_start", "match_label", "result_text"]].copy()
+    matches_list = matches_list.sort_values("day_1_start", ascending=False)
+    matches_list["day_1_start"] = pd.to_datetime(matches_list["day_1_start"]).dt.strftime("%d %b %Y")
+    st.dataframe(
+        matches_list.rename(columns={"day_1_start": "Date", "match_label": "Match", "result_text": "Result"}),
+        width="stretch", hide_index=True,
+    )
+
+    # ---------------- Aggregated batting summary ----------------
+    st.markdown("### Batting summary (aggregated)")
+    if match_batting.empty:
+        st.info(f"No batting innings recorded for {team_label} across the selected matches.")
+    else:
+        bat_rows = match_batting.copy()
+        bat_rows["fours"] = bat_rows["fours"].fillna(0)
+        bat_rows["sixes"] = bat_rows["sixes"].fillna(0)
+
+        valid_bat_keys = bat_rows[["match_id", "innings_id"]].drop_duplicates()
+        if not deliveries_df.empty:
+            bat_deliveries = deliveries_df.merge(valid_bat_keys, on=["match_id", "innings_id"], how="inner").copy()
+            bat_deliveries["wides"] = bat_deliveries["wides"].fillna(0)
+            legal_for_batter = bat_deliveries[bat_deliveries["wides"] == 0]
+            ball_stats = legal_for_batter.groupby("batter_id").agg(
+                dot_balls=("batter_runs", lambda x: (x == 0).sum()),
+                singles=("batter_runs", lambda x: (x == 1).sum()),
+            ).reset_index().rename(columns={"batter_id": "player_id"})
+        else:
+            ball_stats = pd.DataFrame(columns=["player_id", "dot_balls", "singles"])
+
+        agg = bat_rows.groupby("player_id").agg(
+            player_name=("player_name", "first"),
+            innings=("runs", "count"),
+            runs=("runs", "sum"),
+            balls_faced=("balls_faced", "sum"),
+            fours=("fours", "sum"),
+            sixes=("sixes", "sum"),
+        ).reset_index()
+
+        agg = agg.merge(ball_stats, on="player_id", how="left")
+        agg["dot_balls"] = agg["dot_balls"].fillna(0).astype(int)
+        agg["singles"] = agg["singles"].fillna(0).astype(int)
+        agg["boundaries"] = agg["fours"] + agg["sixes"]
+        agg["boundary_detail"] = agg.apply(lambda r: _boundary_detail(r["fours"], r["sixes"]), axis=1)
+        agg["SR"] = agg.apply(lambda r: 100 * r["runs"] / r["balls_faced"] if r["balls_faced"] else None, axis=1)
+        agg["S_pct"] = agg.apply(lambda r: 100 * r["singles"] / r["balls_faced"] if r["balls_faced"] else None, axis=1)
+        agg["D_pct"] = agg.apply(lambda r: 100 * r["dot_balls"] / r["balls_faced"] if r["balls_faced"] else None, axis=1)
+        agg["B_pct"] = agg.apply(lambda r: 100 * r["boundaries"] / r["balls_faced"] if r["balls_faced"] else None, axis=1)
+
+        display_cols = agg[[
+            "player_name", "innings", "runs", "balls_faced", "SR", "singles", "S_pct",
+            "dot_balls", "D_pct", "boundaries", "B_pct", "boundary_detail",
+        ]].sort_values("runs", ascending=False).reset_index(drop=True)
+
+        total_runs = agg["runs"].sum()
+        total_balls = agg["balls_faced"].sum()
+        total_singles = agg["singles"].sum()
+        total_dots = agg["dot_balls"].sum()
+        total_boundaries = agg["boundaries"].sum()
+        total_row = pd.DataFrame([{
+            "player_name": "Team Total",
+            "innings": agg["innings"].sum(),
+            "runs": total_runs,
+            "balls_faced": total_balls,
+            "SR": 100 * total_runs / total_balls if total_balls else None,
+            "singles": total_singles,
+            "S_pct": 100 * total_singles / total_balls if total_balls else None,
+            "dot_balls": total_dots,
+            "D_pct": 100 * total_dots / total_balls if total_balls else None,
+            "boundaries": total_boundaries,
+            "B_pct": 100 * total_boundaries / total_balls if total_balls else None,
+            "boundary_detail": "",
+        }])
+        display_cols = pd.concat([display_cols, total_row], ignore_index=True)
+
+        for col, dp in [("SR", 0), ("S_pct", 1), ("D_pct", 1), ("B_pct", 1)]:
+            display_cols[col] = display_cols[col].apply(lambda x, dp=dp: _fmt(x, dp))
+
+        st.dataframe(
+            display_cols.rename(columns={
+                "player_name": "Batsman", "innings": "Inn", "runs": "Runs", "balls_faced": "Balls Faced",
+                "SR": "SR", "singles": "Singles", "S_pct": "S%", "dot_balls": "Dot Balls", "D_pct": "D%",
+                "boundaries": "Boundaries", "B_pct": "B%", "boundary_detail": "Boundary Detail",
+            }),
+            width="stretch", hide_index=True,
+        )
+
+    # ---------------- Aggregated bowling summary (official figures) ----------------
+    st.markdown("### Bowling summary (aggregated, official figures)")
+    if match_bowling.empty:
+        st.info(f"No bowling innings recorded for {team_label} across the selected matches.")
+    else:
+        bowl_rows = match_bowling.copy()
+        bowl_rows["balls_bowled"] = bowl_rows["overs"].apply(overs_to_balls)
+
+        agg_bowl = bowl_rows.groupby("player_id").agg(
+            player_name=("player_name", "first"),
+            innings=("wickets_taken", "count"),
+            maidens=("maidens", "sum"),
+            runs_conceded=("runs_conceded", "sum"),
+            wickets_taken=("wickets_taken", "sum"),
+            balls_bowled=("balls_bowled", "sum"),
+            wides_bowled=("wides_bowled", "sum"),
+            no_balls_bowled=("no_balls_bowled", "sum"),
+        ).reset_index()
+        agg_bowl["overs_display"] = agg_bowl["balls_bowled"].apply(balls_to_overs_str)
+        agg_bowl["economy"] = agg_bowl.apply(
+            lambda r: r["runs_conceded"] / (r["balls_bowled"] / 6) if r["balls_bowled"] > 0 else None, axis=1,
+        )
+
+        official = agg_bowl[[
+            "player_name", "innings", "overs_display", "maidens", "runs_conceded",
+            "wickets_taken", "economy", "wides_bowled", "no_balls_bowled",
+        ]].sort_values("wickets_taken", ascending=False).reset_index(drop=True)
+
+        total_balls_off = agg_bowl["balls_bowled"].sum()
+        total_runs_off = agg_bowl["runs_conceded"].sum()
+        total_row_off = pd.DataFrame([{
+            "player_name": "Team Total",
+            "innings": agg_bowl["innings"].sum(),
+            "overs_display": balls_to_overs_str(total_balls_off),
+            "maidens": agg_bowl["maidens"].sum(),
+            "runs_conceded": total_runs_off,
+            "wickets_taken": agg_bowl["wickets_taken"].sum(),
+            "economy": (total_runs_off / (total_balls_off / 6)) if total_balls_off > 0 else None,
+            "wides_bowled": agg_bowl["wides_bowled"].sum(),
+            "no_balls_bowled": agg_bowl["no_balls_bowled"].sum(),
+        }])
+        official = pd.concat([official, total_row_off], ignore_index=True)
+        official["economy"] = official["economy"].apply(lambda x: _fmt(x, 2))
+
+        st.dataframe(
+            official.rename(columns={
+                "player_name": "Bowler", "innings": "Inn", "overs_display": "O", "maidens": "M",
+                "runs_conceded": "R", "wickets_taken": "W", "economy": "Econ",
+                "wides_bowled": "Wd", "no_balls_bowled": "NB",
+            }),
+            width="stretch", hide_index=True,
+        )
+
+        # ---------------- Aggregated extrapolated ball-by-ball detail ----------------
+        st.markdown("**Extrapolated ball-by-ball detail (aggregated)**")
+        valid_bowl_keys = bowl_rows[["match_id", "innings_id"]].drop_duplicates()
+        bowl_deliveries = (
+            deliveries_df.merge(valid_bowl_keys, on=["match_id", "innings_id"], how="inner").copy()
+            if not deliveries_df.empty else pd.DataFrame()
+        )
+
+        if bowl_deliveries.empty:
+            st.info("No ball-by-ball data available for the selected matches.")
+        else:
+            prepped = _prep_bowling_deliveries(bowl_deliveries)
+            prepped["is_dot"] = prepped["is_legal"] & (prepped["runs_charged"] == 0)
+            prepped["is_boundary"] = prepped["is_four"] | prepped["is_six"]
+
+            bbb = prepped.groupby("bowler_id").agg(
+                bowler_name=("bowler", "first"),
+                total_balls=("ball_id", "count"),
+                legal_deliveries=("is_legal", "sum"),
+                dot_balls=("is_dot", "sum"),
+                boundaries_conceded=("is_boundary", "sum"),
+            ).reset_index()
+            bbb["balls_scored_from"] = bbb["legal_deliveries"] - bbb["dot_balls"]
+            bbb["dot_pct"] = bbb.apply(
+                lambda r: 100 * r["dot_balls"] / r["legal_deliveries"] if r["legal_deliveries"] > 0 else None, axis=1,
+            )
+            bbb["boundary_pct"] = bbb.apply(
+                lambda r: 100 * r["boundaries_conceded"] / r["legal_deliveries"] if r["legal_deliveries"] > 0 else None, axis=1,
+            )
+            bbb["scoring_shot_pct"] = bbb.apply(
+                lambda r: 100 * r["balls_scored_from"] / r["legal_deliveries"] if r["legal_deliveries"] > 0 else None, axis=1,
+            )
+
+            # Group the 5-dot-over check by (bowler, match, innings, over) so
+            # "over 3" of one match isn't conflated with "over 3" of another.
+            legal_only = prepped[prepped["is_legal"]]
+            per_over = legal_only.groupby(["bowler_id", "match_id", "innings_id", "over"]).agg(
+                dots_in_over=("is_dot", "sum"),
+            ).reset_index()
+            five_dot = (
+                per_over[per_over["dots_in_over"] >= 5]
+                .groupby("bowler_id").size().reset_index(name="five_dot_overs")
+            )
+            bbb = bbb.merge(five_dot, on="bowler_id", how="left")
+            bbb["five_dot_overs"] = bbb["five_dot_overs"].fillna(0).astype(int)
+
+            bbb_cols = [
+                "bowler_name", "total_balls", "legal_deliveries", "dot_balls", "dot_pct",
+                "boundaries_conceded", "boundary_pct", "scoring_shot_pct", "five_dot_overs", "balls_scored_from",
+            ]
+            total_legal = bbb["legal_deliveries"].sum()
+            total_dots = bbb["dot_balls"].sum()
+            total_boundaries = bbb["boundaries_conceded"].sum()
+            total_scored_from = bbb["balls_scored_from"].sum()
+            total_row_bbb = pd.DataFrame([{
+                "bowler_name": "Team Total",
+                "total_balls": bbb["total_balls"].sum(),
+                "legal_deliveries": total_legal,
+                "dot_balls": total_dots,
+                "dot_pct": 100 * total_dots / total_legal if total_legal > 0 else None,
+                "boundaries_conceded": total_boundaries,
+                "boundary_pct": 100 * total_boundaries / total_legal if total_legal > 0 else None,
+                "scoring_shot_pct": 100 * total_scored_from / total_legal if total_legal > 0 else None,
+                "five_dot_overs": bbb["five_dot_overs"].sum(),
+                "balls_scored_from": total_scored_from,
+            }])
+
+            bbb_display = pd.concat([
+                bbb[bbb_cols].sort_values("legal_deliveries", ascending=False),
+                total_row_bbb[bbb_cols],
+            ], ignore_index=True)
+            for col in ["dot_pct", "boundary_pct", "scoring_shot_pct"]:
+                bbb_display[col] = bbb_display[col].apply(lambda x: _fmt(x, 1))
+
+            st.dataframe(
+                bbb_display.rename(columns={
+                    "bowler_name": "Bowler", "total_balls": "Total Balls", "legal_deliveries": "Legal Deliveries",
+                    "dot_balls": "Dot Balls", "dot_pct": "Dot%", "boundaries_conceded": "Boundaries Conceded",
+                    "boundary_pct": "Boundary%", "scoring_shot_pct": "Scoring Shot%",
+                    "five_dot_overs": "5-Dot Overs", "balls_scored_from": "Balls Scored From",
+                }),
+                width="stretch", hide_index=True,
+            )
+
+    st.markdown("### Notes")
+    st.caption(
+        "- This is an aggregate across multiple matches -- select exactly one match above instead "
+        "of leaving Match empty/multi-selected to see full per-innings detail, extras breakdown, "
+        "and ball-by-ball video links for a specific match.\n"
+        "- Team totals are the sum of individual figures across all selected matches.\n"
+        "- Dot Balls = legal deliveries with zero runs charged to the bowler (leg byes/byes still "
+        "count as dot balls, since they aren't charged against the bowler's figures).\n"
+        "- Balls Scored From = Legal Deliveries minus Dot Balls."
     )
