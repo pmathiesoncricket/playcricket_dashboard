@@ -13,6 +13,7 @@ from helpers import add_season_column, cascading_multiselect, MAROON, MAROON_SHA
 from tab_batting import build_timestamped_youtube_url, resolve_ball_video_url, _pad, NBSP
 
 DASH = "\u2013"
+UNKNOWN_LABEL = "Unknown / unrecorded"
 
 # Safety cap, checked as soon as Grade/Match type/Season resolve to a match
 # set (before the scoped bowling-innings fetch runs). Same idea as the
@@ -150,6 +151,27 @@ def _render_metrics_table(df, category_col, category_label, sort_col="wickets"):
     )
 
 
+def _apply_own_style_filter(df, column, selected_values):
+    """
+    Applies the "bowler's own attribute" sidebar filters (pace/spin, bowl
+    style, batter hand) without silently dropping bowlers who have NO
+    recorded value for that attribute at all. `.isin([...])` alone always
+    evaluates False for NaN, so with each filter defaulted to "every known
+    value selected" (meant to behave like "no filter"), bowlers with an
+    incomplete player_style record were being excluded from the ENTIRE
+    summary table -- this was the actual cause of "filtering to one grade
+    over four seasons only shows 8 bowlers" reported in testing.
+    UNKNOWN_LABEL is its own selectable bucket covering exactly those NaN
+    rows, and is included by default alongside the real values.
+    """
+    if not selected_values:
+        return df
+    mask = df[column].isin(selected_values)
+    if UNKNOWN_LABEL in selected_values:
+        mask = mask | df[column].isna()
+    return df[mask]
+
+
 def bowling_tab():
     st.header("Bowling")
 
@@ -249,25 +271,26 @@ def bowling_tab():
     # only computed/shown AFTER Apply Filters, since they depend on the
     # scoped fetch above. Once loaded, all four stay live (no need to
     # click Apply again) since they only ever narrow the match set
-    # further, never past the cap already enforced above.
+    # further, never past the cap already enforced above. Each of the
+    # first three includes an explicit "Unknown / unrecorded" bucket (see
+    # _apply_own_style_filter) so a bowler with incomplete player_style
+    # data doesn't silently disappear from the whole page.
     # ---------------------------------------------------------------
     stage_df = bowling_df.copy()
 
-    pace_spin_options = sorted(stage_df["pace_spin"].dropna().unique().tolist())
+    pace_spin_options = sorted(stage_df["pace_spin"].dropna().unique().tolist()) + [UNKNOWN_LABEL]
     selected_pace_spin = cascading_multiselect(
         st.sidebar, "Bowling type (pace/spin)", pace_spin_options, "bowl_filter_pace_spin",
         default_options=pace_spin_options,
     )
-    if selected_pace_spin:
-        stage_df = stage_df[stage_df["pace_spin"].isin(selected_pace_spin)]
+    stage_df = _apply_own_style_filter(stage_df, "pace_spin", selected_pace_spin)
 
-    bowl_style_options = sorted(stage_df["bowl_style"].dropna().unique().tolist())
+    bowl_style_options = sorted(stage_df["bowl_style"].dropna().unique().tolist()) + [UNKNOWN_LABEL]
     selected_bowl_style = cascading_multiselect(
         st.sidebar, "Bowling style", bowl_style_options, "bowl_filter_bowl_style",
         default_options=bowl_style_options,
     )
-    if selected_bowl_style:
-        stage_df = stage_df[stage_df["bowl_style"].isin(selected_bowl_style)]
+    stage_df = _apply_own_style_filter(stage_df, "bowl_style", selected_bowl_style)
 
     # Batter hand -- mirrors the pace_spin/bowl_style filters above exactly:
     # joined onto this row's own player_id, so it filters the pool of
@@ -275,13 +298,12 @@ def bowling_tab():
     # bowled AT (a ball-by-ball concept) is covered separately by the
     # "Bowling vs batter hand" and "Summary by batter hand" sections below,
     # which join player_style a second time -- onto deliveries.batter_id.
-    batter_hand_options = sorted(stage_df["batter_hand"].dropna().unique().tolist())
+    batter_hand_options = sorted(stage_df["batter_hand"].dropna().unique().tolist()) + [UNKNOWN_LABEL]
     selected_batter_hand = cascading_multiselect(
         st.sidebar, "Batter hand (bowler's own)", batter_hand_options, "bowl_filter_batter_hand",
         default_options=batter_hand_options,
     )
-    if selected_batter_hand:
-        stage_df = stage_df[stage_df["batter_hand"].isin(selected_batter_hand)]
+    stage_df = _apply_own_style_filter(stage_df, "batter_hand", selected_batter_hand)
 
     opponent_options = sorted(stage_df["opponent_team"].dropna().unique().tolist())
     selected_opponent = cascading_multiselect(
@@ -377,9 +399,19 @@ def bowling_tab():
     ].sort_values("wickets", ascending=False).reset_index(drop=True)
     summary_table["wickets"] = summary_table["wickets"].fillna(0).astype(int)
 
-    MAX_ROWS_VISIBLE = 10
+    # Table height is capped so a single-bowler selection doesn't leave a
+    # block of empty blank rows, but tall enough that most multi-grade
+    # filters show everyone without scrolling. The caption states the
+    # true count either way, so it's never ambiguous whether you're
+    # seeing everyone who matches the filters.
+    MAX_ROWS_VISIBLE = 25
     rows_to_show = min(len(summary_table), MAX_ROWS_VISIBLE)
     TABLE_HEIGHT = (rows_to_show + 1) * 35 + 3
+
+    st.caption(
+        f"{len(summary_table)} bowler(s) match the current filters."
+        + (" Scroll within the table below to see all of them." if len(summary_table) > MAX_ROWS_VISIBLE else "")
+    )
 
     summary_event = st.dataframe(
         summary_table,
