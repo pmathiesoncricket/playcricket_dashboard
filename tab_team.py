@@ -24,10 +24,16 @@ PHASES = {
 OUTCOME_ORDER = ["Win", "Draw", "Tie", "Loss"]
 OUTCOME_COLORS = {"Win": MAROON, "Draw": "#9E3A5D", "Tie": "#C97292", "Loss": "#4A0F29"}
 PACE_SPIN_COLORS = {"Pace": "#0739BE", "Spin": "#73173F", "Unknown": "#6b6b6b"}
+SHADE_A = "rgba(115,23,63,0.10)"
+SHADE_B = "rgba(7,57,190,0.10)"
 
 
 def _fmt(x, dp=2):
     return f"{x:.{dp}f}" if pd.notna(x) else DASH
+
+
+def _pct(x):
+    return f"{x:.0f}%" if pd.notna(x) else DASH
 
 
 def _phase_label(match_type, over):
@@ -82,13 +88,19 @@ def _score_label(runs, wickets, overs):
     return f"{runs_i} ({overs_str} ov)"
 
 
-def _html_table(df, align=None, center_all=False, bold_before=None, font_size="0.9rem", stretch=False):
+def _html_table(df, align=None, center_all=False, bold_before=None, font_size="0.9rem", stretch=False, col_shades=None):
+    """Renders a dataframe as a plain HTML table with per-column text
+    alignment, optional bold top-border row separators, and optional
+    subtle per-column background shading (col_shades: {colname: css_color})
+    -- used to visually group "breakdown" columns (e.g. Pace vs Spin,
+    v LHB vs v RHB) apart from the headline totals."""
     align = align or {}
     bold_before = bold_before or set()
+    col_shades = col_shades or {}
     width_style = "width:100%;" if stretch else ""
     header = "".join(
         f'<th style="text-align:{align.get(c, "left")};padding:4px 8px;border-bottom:1px solid #444;'
-        f'font-size:{font_size};">{c}</th>'
+        f'font-size:{font_size};background:{col_shades.get(c, "transparent")};">{c}</th>'
         for c in df.columns
     )
     rows_html = []
@@ -96,7 +108,7 @@ def _html_table(df, align=None, center_all=False, bold_before=None, font_size="0
         border = "border-top:2px solid #888;" if i in bold_before else ""
         cells = "".join(
             f'<td style="text-align:{"center" if center_all else align.get(c, "left")};padding:4px 8px;'
-            f'font-size:{font_size};{border}">{row[c]}</td>'
+            f'font-size:{font_size};background:{col_shades.get(c, "transparent")};{border}">{row[c]}</td>'
             for c in df.columns
         )
         rows_html.append(f"<tr>{cells}</tr>")
@@ -345,7 +357,6 @@ def _render_recent_form(team_matches):
         st.info("No recent matches available.")
         return
 
-    match_ids = tuple(str(m) for m in recent["match_id"].unique())
     innings_df = get_innings()
     innings_df = innings_df[innings_df["match_id"].isin(recent["match_id"])].sort_values("innings_order")
 
@@ -353,8 +364,6 @@ def _render_recent_form(team_matches):
     for _, r in recent.iterrows():
         our_innings = innings_df[(innings_df["match_id"] == r["match_id"]) & (innings_df["batting_team_id"] == r["our_team_id"])]
         opp_innings = innings_df[(innings_df["match_id"] == r["match_id"]) & (innings_df["batting_team_id"] == r["opponent_team_id"])]
-        # Where a team batted more than once (Two Day), the LAST innings
-        # recorded is used as the team's final score for this quick summary.
         our_last = our_innings.tail(1)
         opp_last = opp_innings.tail(1)
         our_score = _score_label(
@@ -445,9 +454,6 @@ def _render_batting_avg_scores(team_matches, batting_pi):
         if sub.empty:
             continue
         win_sub = sub[sub["outcome"] == "Win"]
-        # A team bowled out for 0 is an extreme outlier that isn't
-        # informative as a "typical lowest score" -- excluded from the
-        # Lowest figure specifically (not from the mean/highest/count).
         sub_nonzero = sub[sub["runs"] > 0]
         win_nonzero = win_sub[win_sub["runs"] > 0]
         rows.append({
@@ -468,9 +474,6 @@ def _render_batting_avg_scores(team_matches, batting_pi):
 
     st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
 
-    # Clustered histogram: all of this team's innings (any match type,
-    # batting first or second), bucketed into 50-run bands, one cluster of
-    # bars per bucket with a bar per match type.
     all_totals = batting_pi[batting_pi["match_id"].isin(team_matches["match_id"])].groupby(
         ["match_id", "innings_id", "team_id"]
     ).agg(runs=("runs", "sum")).reset_index()
@@ -502,7 +505,7 @@ def _render_lineup(team_matches, batting_pi, bowling_pi, our_bowling_deliveries,
     st.subheader("Lineup")
 
     hand_lookup = style_df.set_index("player_id")["batter_hand"].to_dict()
-    pace_spin_lookup = style_df.set_index("player_id")["pace_spin"].to_dict()
+    bowl_style_lookup = style_df.set_index("player_id")["bowl_style"].to_dict()
 
     for mt in sorted(team_matches["match_type"].unique()):
         mt_matches = team_matches[team_matches["match_type"] == mt].sort_values("day_1_start", ascending=False)
@@ -533,9 +536,6 @@ def _render_lineup(team_matches, batting_pi, bowling_pi, our_bowling_deliveries,
 
         bat_rows = bat_rows.sort_values("bat_position")
 
-        # Matches played by each listed player, within this match type and
-        # the current Team Preview scope (union of batting/bowling
-        # appearances, since a player might only bowl or only bat).
         mt_match_ids = set(mt_matches["match_id"])
         bat_appearances = batting_pi[
             batting_pi["match_id"].isin(mt_match_ids) & (batting_pi["team_id"] == our_team_id)
@@ -576,14 +576,18 @@ def _render_lineup(team_matches, batting_pi, bowling_pi, our_bowling_deliveries,
                     w = int(bwr["wickets_taken"]) if pd.notna(bwr["wickets_taken"]) else 0
                     r = int(bwr["runs_conceded"]) if pd.notna(bwr["runs_conceded"]) else 0
                     bowl_str = f"{w}/{r}"
-                style = pace_spin_lookup.get(pid)
+                style = bowl_style_lookup.get(pid)
                 style_str = style if pd.notna(style) and style else "-"
                 bowl_ord_str = str(bowl_order_map.get(pid, "-"))
 
+            # Column order: batting/match-level fields grouped together
+            # first (Pos, Player, Hand, Runs @ SR), then bowling fields
+            # (Bowl Ord, Type, Overs, Figures), with Matches last.
             display_rows.append({
                 "Pos": br["bat_position"], "Player": br["player_name"] + keeper_tag, "Hand": hand_str,
-                "Runs @ SR": score_str, "Matches": matches_played_map.get(pid, 1),
+                "Runs @ SR": score_str,
                 "Bowl Ord": bowl_ord_str, "Type": style_str, "Overs": overs_str, "Figures": bowl_str,
+                "Matches": matches_played_map.get(pid, 1),
             })
 
         disp = pd.DataFrame(display_rows)
@@ -614,7 +618,7 @@ def _phase_metrics(d, group_cols, match_type):
     ).reset_index()
     g["SR"] = g.apply(lambda r: 100 * r["runs"] / r["balls"] if r["balls"] > 0 else None, axis=1)
     g["BPD"] = g.apply(lambda r: r["balls"] / r["dismissals"] if r["dismissals"] > 0 else None, axis=1)
-    g["ScoringShotPct"] = g.apply(lambda r: 100 * r["scoring"] / r["balls"] if r["balls"] > 0 else None, axis=1)
+    g["SSpct"] = g.apply(lambda r: 100 * r["scoring"] / r["balls"] if r["balls"] > 0 else None, axis=1)
     g["phase"] = pd.Categorical(g["phase"], categories=_phase_order(match_type), ordered=True)
     return g.sort_values(group_cols + ["phase"])
 
@@ -636,13 +640,15 @@ def _render_batting_phase(our_batting_deliveries, pop_deliveries, selected_match
             continue
         merged = team_overall.merge(pop_overall, on="phase", suffixes=("", "_all"), how="left")
 
-        disp = merged[["phase", "SR", "BPD", "SR_all", "BPD_all"]].copy()
+        disp = merged[["phase", "SR", "BPD", "SSpct", "SR_all", "BPD_all", "SSpct_all"]].copy()
         for c in ["SR", "BPD", "SR_all", "BPD_all"]:
             disp[c] = disp[c].apply(lambda x: _fmt(x, 0))
+        for c in ["SSpct", "SSpct_all"]:
+            disp[c] = disp[c].apply(_pct)
         st.dataframe(
             disp.rename(columns={
-                "phase": "Phase", "SR": "Team SR", "BPD": "Team BPD",
-                "SR_all": "All Teams SR", "BPD_all": "All Teams BPD",
+                "phase": "Phase", "SR": "Team SR", "BPD": "Team BPD", "SSpct": "Team SS%",
+                "SR_all": "All Teams SR", "BPD_all": "All Teams BPD", "SSpct_all": "All Teams SS%",
             }),
             width="stretch", hide_index=True,
         )
@@ -652,11 +658,15 @@ def _render_batting_phase(our_batting_deliveries, pop_deliveries, selected_match
             m = _phase_metrics(sub, [], mt)
             if m.empty:
                 continue
-            m_disp = m[["phase", "SR", "BPD"]].copy()
+            m_disp = m[["phase", "SR", "BPD", "SSpct"]].copy()
             m_disp["SR"] = m_disp["SR"].apply(lambda x: _fmt(x, 0))
             m_disp["BPD"] = m_disp["BPD"].apply(lambda x: _fmt(x, 0))
+            m_disp["SSpct"] = m_disp["SSpct"].apply(_pct)
             st.caption(outcome_label)
-            st.dataframe(m_disp.rename(columns={"phase": "Phase"}), width="stretch", hide_index=True)
+            st.dataframe(
+                m_disp.rename(columns={"phase": "Phase", "SSpct": "SS%"}),
+                width="stretch", hide_index=True,
+            )
 
 
 # =========================================================================
@@ -678,16 +688,16 @@ def _render_batting_bowltype_phase(our_batting_deliveries, pop_deliveries, selec
             st.info("No data.")
             continue
         merged = m.merge(pop_m, on=["bowler_pace_spin", "phase"], suffixes=("", "_all"), how="left")
-        disp = merged[["bowler_pace_spin", "phase", "SR", "BPD", "ScoringShotPct", "SR_all", "BPD_all", "ScoringShotPct_all"]].copy()
+        disp = merged[["bowler_pace_spin", "phase", "SR", "BPD", "SSpct", "SR_all", "BPD_all", "SSpct_all"]].copy()
         for c in ["SR", "BPD", "SR_all", "BPD_all"]:
             disp[c] = disp[c].apply(lambda x: _fmt(x, 0))
-        for c in ["ScoringShotPct", "ScoringShotPct_all"]:
-            disp[c] = disp[c].apply(lambda x: f"{x:.0f}%" if pd.notna(x) else DASH)
+        for c in ["SSpct", "SSpct_all"]:
+            disp[c] = disp[c].apply(_pct)
         st.dataframe(
             disp.rename(columns={
                 "bowler_pace_spin": "Bowling type", "phase": "Phase",
-                "SR": "Team SR", "BPD": "Team BPD", "ScoringShotPct": "Team Scoring Shot %",
-                "SR_all": "All Teams SR", "BPD_all": "All Teams BPD", "ScoringShotPct_all": "All Teams Scoring Shot %",
+                "SR": "Team SR", "BPD": "Team BPD", "SSpct": "Team SS%",
+                "SR_all": "All Teams SR", "BPD_all": "All Teams BPD", "SSpct_all": "All Teams SS%",
             }),
             width="stretch", hide_index=True,
         )
@@ -715,16 +725,17 @@ def _render_batting_individuals(team_matches, batting_pi, our_batting_deliveries
         return g
 
     def _delivery_metrics(df):
-        """Runs/balls/dismissals/scoring from ball-by-ball data -- needed
-        for Scoring Shot %, which player_innings totals can't provide."""
         balls = df["is_legal_for_batter"].sum()
         dismissals = df["is_dismissal_batter"].sum()
         scoring = df["is_scoring"].sum()
         return pd.Series({
             "SR": 100 * df["batter_runs"].sum() / balls if balls > 0 else None,
             "BPD": balls / dismissals if dismissals > 0 else None,
-            "ScoringShotPct": 100 * scoring / balls if balls > 0 else None,
+            "SSpct": 100 * scoring / balls if balls > 0 else None,
         })
+
+    pace_cols = ["SR (Pace)", "BPD (Pace)", "SS% (Pace)"]
+    spin_cols = ["SR (Spin)", "BPD (Spin)", "SS% (Spin)"]
 
     for mt in [m for m in ["One Day", "Two Day", "T20"] if m in selected_match_types]:
         mt_matches = team_matches[team_matches["match_type"] == mt]
@@ -746,25 +757,23 @@ def _render_batting_individuals(team_matches, batting_pi, our_batting_deliveries
             hand = hand_lookup.get(pid)
             player_balls = mt_deliveries[mt_deliveries["batter_id"] == pid]
 
-            total_ss = _delivery_metrics(player_balls)["ScoringShotPct"] if not player_balls.empty else None
+            total_ss = _delivery_metrics(player_balls)["SSpct"] if not player_balls.empty else None
             pace_m = _delivery_metrics(player_balls[player_balls["bowler_pace_spin"] == "Pace"]) if not player_balls.empty else pd.Series()
             spin_m = _delivery_metrics(player_balls[player_balls["bowler_pace_spin"] == "Spin"]) if not player_balls.empty else pd.Series()
 
             rows.append({
                 "Player": r["player_name"], "Hand": hand if pd.notna(hand) and hand else "-",
-                "Runs": int(r["runs"]), "Average": _fmt(r["Average"]), "SR": _fmt(r["SR"], 0), "BPD": _fmt(r["BPD"], 0),
-                "Scoring Shot %": f"{total_ss:.0f}%" if pd.notna(total_ss) else DASH,
-                "SR (Pace)": _fmt(pace_m.get("SR"), 0), "BPD (Pace)": _fmt(pace_m.get("BPD"), 0),
-                "SS% (Pace)": f"{pace_m.get('ScoringShotPct'):.0f}%" if pd.notna(pace_m.get("ScoringShotPct")) else DASH,
-                "SR (Spin)": _fmt(spin_m.get("SR"), 0), "BPD (Spin)": _fmt(spin_m.get("BPD"), 0),
-                "SS% (Spin)": f"{spin_m.get('ScoringShotPct'):.0f}%" if pd.notna(spin_m.get("ScoringShotPct")) else DASH,
+                "Runs": str(int(r["runs"])), "Average": _fmt(r["Average"]), "SR": _fmt(r["SR"], 0), "BPD": _fmt(r["BPD"], 0),
+                "SS%": _pct(total_ss),
+                "SR (Pace)": _fmt(pace_m.get("SR"), 0), "BPD (Pace)": _fmt(pace_m.get("BPD"), 0), "SS% (Pace)": _pct(pace_m.get("SSpct")),
+                "SR (Spin)": _fmt(spin_m.get("SR"), 0), "BPD (Spin)": _fmt(spin_m.get("BPD"), 0), "SS% (Spin)": _pct(spin_m.get("SSpct")),
             })
 
         st.markdown(f"**{mt} \u2014 top run scorers**")
-        num_cols = ["Runs", "Average", "SR", "BPD", "Scoring Shot %", "SR (Pace)", "BPD (Pace)", "SS% (Pace)", "SR (Spin)", "BPD (Spin)", "SS% (Spin)"]
-        disp_df = pd.DataFrame(rows)
-        disp_df["Runs"] = disp_df["Runs"].astype(str)
-        _html_table(disp_df, align={c: "right" for c in num_cols}, stretch=True)
+        num_cols = ["Runs", "Average", "SR", "BPD", "SS%"] + pace_cols + spin_cols
+        col_shades = {c: SHADE_A for c in pace_cols}
+        col_shades.update({c: SHADE_B for c in spin_cols})
+        _html_table(pd.DataFrame(rows), align={c: "right" for c in num_cols}, stretch=True, col_shades=col_shades)
 
 
 # =========================================================================
@@ -816,29 +825,47 @@ def _render_bowling_deployment(team_matches, our_bowling_deliveries, style_df):
             initials = initials_map.get(r["bowler"], "??")
             color = PACE_SPIN_COLORS.get(style, PACE_SPIN_COLORS["Unknown"])
             tooltip = f"{r['bowler']} ({bowl_style_full}) \u2014 {int(r['wickets'])}/{int(r['runs'])} this over"
-            cells[over_num] = (initials, color, tooltip)
+            cells[over_num] = (initials, color, tooltip, r["bowler_id"])
 
         cell_font = "1rem"
         cell_pad = "8px"
         col_width = 100 / ((max_over + 1) // 2)
+        EDGE_BORDER = "3px solid #eee"
+        SPELL_BORDER = "3px solid #eee"
 
-        def _cell(o):
-            if o not in cells:
-                return f'<td style="padding:{cell_pad};width:{col_width:.2f}%"></td>'
-            ini, color, tip = cells[o]
-            return (
-                f'<td style="background:{color};color:white;text-align:center;padding:{cell_pad};'
-                f'font-size:{cell_font};width:{col_width:.2f}%" title="Over {o}: {tip}">{ini}</td>'
-            )
+        def _row_cells(over_range):
+            over_list = list(over_range)
+            html_parts = []
+            for idx, o in enumerate(over_list):
+                is_table_start = idx == 0
+                is_table_end = idx == len(over_list) - 1
+                cur_bowler = cells[o][3] if o in cells else None
+                # Look ahead within THIS row's sequence (same end -- odds or
+                # evens), since a spell is consecutive overs from one end.
+                next_o = over_list[idx + 1] if idx + 1 < len(over_list) else None
+                next_bowler = cells[next_o][3] if (next_o is not None and next_o in cells) else None
+                spell_ends_here = (cur_bowler is not None) and (next_bowler != cur_bowler)
 
-        odd_cells = "".join(_cell(o) for o in range(1, max_over + 1, 2))
-        even_cells = "".join(_cell(o) for o in range(2, max_over + 1, 2))
-        header_odd = "".join(
-            f'<th style="font-size:0.8rem;padding:4px;text-align:center">{o}</th>' for o in range(1, max_over + 1, 2)
-        )
-        header_even = "".join(
-            f'<th style="font-size:0.8rem;padding:4px;text-align:center">{o}</th>' for o in range(2, max_over + 1, 2)
-        )
+                left = EDGE_BORDER if is_table_start else "none"
+                right = EDGE_BORDER if is_table_end else (SPELL_BORDER if spell_ends_here else "none")
+                border_style = f"border-left:{left};border-right:{right};border-top:{EDGE_BORDER};border-bottom:{EDGE_BORDER};"
+
+                if o not in cells:
+                    html_parts.append(f'<td style="padding:{cell_pad};width:{col_width:.2f}%;{border_style}"></td>')
+                else:
+                    ini, color, tip, _ = cells[o]
+                    html_parts.append(
+                        f'<td style="background:{color};color:white;text-align:center;padding:{cell_pad};'
+                        f'font-size:{cell_font};width:{col_width:.2f}%;{border_style}" title="Over {o}: {tip}">{ini}</td>'
+                    )
+            return "".join(html_parts)
+
+        odd_range = range(1, max_over + 1, 2)
+        even_range = range(2, max_over + 1, 2)
+        odd_cells = _row_cells(odd_range)
+        even_cells = _row_cells(even_range)
+        header_odd = "".join(f'<th style="font-size:0.8rem;padding:4px;text-align:center">{o}</th>' for o in odd_range)
+        header_even = "".join(f'<th style="font-size:0.8rem;padding:4px;text-align:center">{o}</th>' for o in even_range)
 
         st.markdown(
             f"""
@@ -879,7 +906,7 @@ def _render_bowling_deployment(team_matches, our_bowling_deliveries, style_df):
             g["phase"] = pd.Categorical(g["phase"], categories=_phase_order("Two Day"), ordered=True)
             g = g.sort_values(["phase", "overs"], ascending=[True, False]).reset_index(drop=True)
 
-            bowl_style_lookup = style_df.set_index("player_id")["pace_spin"].to_dict()
+            bowl_style_lookup = style_df.set_index("player_id")["bowl_style"].to_dict()
             g["Type"] = g["bowler_id"].map(bowl_style_lookup).fillna("Unknown")
             g["economy"] = g["economy"].apply(lambda x: _fmt(x, 2))
 
@@ -947,7 +974,7 @@ def _render_bowling_phase(our_bowling_deliveries, pop_deliveries, selected_match
         for c in ["economy", "BPD", "economy_all", "BPD_all"]:
             disp[c] = disp[c].apply(lambda x: _fmt(x, 2))
         for c in style_cols:
-            disp[c] = disp[c].apply(lambda x: f"{x:.0f}%" if pd.notna(x) else DASH)
+            disp[c] = disp[c].apply(_pct)
         st.dataframe(
             disp.rename(columns={
                 "phase": "Phase", "economy": "Team Econ", "BPD": "Team BPD",
@@ -965,6 +992,8 @@ def _render_bowling_individuals(team_matches, bowling_pi, our_bowling_deliveries
     st.subheader("Bowling \u2014 Individuals")
 
     style_lookup = style_df.set_index("player_id")["bowl_style"].to_dict()
+    lhb_cols = ["Econ (v LHB)", "BPD (v LHB)"]
+    rhb_cols = ["Econ (v RHB)", "BPD (v RHB)"]
 
     for mt in [m for m in ["One Day", "Two Day", "T20"] if m in selected_match_types]:
         mt_matches = team_matches[team_matches["match_type"] == mt]
@@ -1009,10 +1038,13 @@ def _render_bowling_individuals(team_matches, bowling_pi, our_bowling_deliveries
 
             rows.append({
                 "Player": r["player_name"], "Style": style if pd.notna(style) and style else "-",
-                "Wickets": int(r["wickets"]), "Economy": _fmt(r["economy"]), "BPD": _fmt(r["BPD"], 0),
+                "Wickets": str(int(r["wickets"])), "Economy": _fmt(r["economy"]), "BPD": _fmt(r["BPD"], 0),
                 "Econ (v LHB)": _fmt(econ_l), "BPD (v LHB)": _fmt(bpd_l, 0),
                 "Econ (v RHB)": _fmt(econ_r), "BPD (v RHB)": _fmt(bpd_r, 0),
             })
 
         st.markdown(f"**{mt} \u2014 top wicket takers**")
-        st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
+        num_cols = ["Wickets", "Economy", "BPD"] + lhb_cols + rhb_cols
+        col_shades = {c: SHADE_A for c in lhb_cols}
+        col_shades.update({c: SHADE_B for c in rhb_cols})
+        _html_table(pd.DataFrame(rows), align={c: "right" for c in num_cols}, stretch=True, col_shades=col_shades)
