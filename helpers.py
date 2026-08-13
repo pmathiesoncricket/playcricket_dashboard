@@ -34,51 +34,76 @@ def cascading_multiselect(container, label: str, options: list, key: str,
                            default_options: list | None = None, enable_quick_add: bool = False):
     """
     Standard multiselect used throughout the app, with cascading behaviour
-    (stale selections no longer present in `options` get dropped) and an
-    optional "quick add" helper.
+    (stale selections no longer present in `options` get dropped), a full
+    list of whatever's currently selected shown as plain text underneath,
+    and an optional "search + tick" helper for quickly selecting several
+    options that share a keyword.
 
-    enable_quick_add=True renders a small text input + button UNDER the
-    multiselect: type a keyword and click "Add matches" to select every
-    currently-available option containing that keyword in one go. This
-    exists because Streamlit's own multiselect search box resets back to
-    the full option list after every click -- there's no parameter to keep
-    it open, so selecting several options that share a substring (e.g.
-    every grade with "Woolnough" in the name) normally means re-typing the
-    search term after each individual click. The mutation happens BEFORE
-    the multiselect widget is instantiated in this same run, since
-    Streamlit disallows writing to st.session_state[key] for a widget
-    that's already been created earlier in the same script execution.
+    The plain-text "currently selected" list exists because Streamlit's
+    own selected-value pills truncate long names with no way to attach a
+    native hover tooltip via the public API -- this is the practical
+    workaround for actually being able to read a long grade/team name.
+
+    enable_quick_add=True adds a search box under the multiselect; typing
+    into it shows a live checklist of every currently-available option
+    containing that keyword, and ticking any of them adds/removes it from
+    the selection immediately (no extra button click needed). This exists
+    because Streamlit's own multiselect dropdown resets its search box
+    back to the full option list after every click, so there's no way to
+    select several options sharing a keyword (e.g. every grade with
+    "Woolnough" in the name) without retyping the search after each pick.
+    The search box here is a separate widget from the checkboxes, so
+    ticking one doesn't clear or affect it -- it stays exactly as typed
+    while you work through the rest of the matches.
     """
     sanitize_multiselect_state(key, options)
 
+    current_selection = st.session_state.get(
+        key, list(default_options) if default_options is not None else []
+    )
+
     if enable_quick_add and options:
-        quick_add_key = f"{key}_quick_add_text"
-        search_text = container.text_input(
-            f"Quick-add to {label}",
-            key=quick_add_key,
-            placeholder=f"Type a keyword shared by several {label} options, then click Add matches",
-            help=(
-                "Streamlit's dropdown search resets after each click, so this lets you add every "
-                "matching option in one go instead of re-searching for each one."
-            ),
+        search_term = container.text_input(
+            f"Search {label}",
+            key=f"{key}_quick_search",
+            placeholder=f"Type a keyword shared by several {label} options",
         )
-        if container.button(f"Add matches to {label}", key=f"{key}_quick_add_btn"):
-            term = search_text.strip().lower()
-            if term:
-                matches = [opt for opt in options if term in opt.lower()]
-                if matches:
-                    current = st.session_state.get(
-                        key, list(default_options) if default_options is not None else []
-                    )
-                    merged = list(dict.fromkeys(current + matches))
-                    if merged != current:
-                        st.session_state[key] = merged
+        term = search_term.strip().lower()
+        if term:
+            matches = [opt for opt in options if term in opt.lower()]
+            if matches:
+                new_selection = list(current_selection)
+                changed = False
+                for opt in matches:
+                    cb_key = f"{key}_cb_{opt}"
+                    # Sync the checkbox to the TRUE current selection before
+                    # it's instantiated this run, so it can never drift out
+                    # of sync with the main multiselect (e.g. if an option
+                    # was instead removed via its pill's "x").
+                    st.session_state[cb_key] = opt in new_selection
+                    checked = container.checkbox(opt, key=cb_key)
+                    if checked and opt not in new_selection:
+                        new_selection.append(opt)
+                        changed = True
+                    elif not checked and opt in new_selection:
+                        new_selection.remove(opt)
+                        changed = True
+                if changed:
+                    st.session_state[key] = new_selection
+                    current_selection = new_selection
+            else:
+                container.caption(f"No {label} options match \u201c{search_term}\u201d.")
 
     kwargs = {}
     if key not in st.session_state:
         kwargs["default"] = default_options if default_options is not None else []
     container.multiselect(label, options, key=key, **kwargs)
-    return st.session_state.get(key, [])
+
+    selected = st.session_state.get(key, [])
+    if selected:
+        container.caption(f"**{label}:** " + ", ".join(selected))
+
+    return selected
 
 
 def segment_label(ball_index: int) -> str:
