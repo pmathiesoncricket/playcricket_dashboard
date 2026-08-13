@@ -190,6 +190,22 @@ def batting_tab():
         return
 
     # ---------------------------------------------------------------
+    # Team (batting team) -- multi-select so a club that's played under
+    # different names in different grades/seasons can be selected as one
+    # group. Applied directly to the batting-team column on each row.
+    # ---------------------------------------------------------------
+    team_options = sorted(stage_df["team"].dropna().unique().tolist())
+    selected_team = cascading_multiselect(
+        st.sidebar, "Team (batting team)", team_options, "filter_team"
+    )
+    if selected_team:
+        stage_df = stage_df[stage_df["team"].isin(selected_team)]
+
+    if stage_df.empty:
+        st.warning("No batting records match the current filters.")
+        return
+
+    # ---------------------------------------------------------------
     # Opponent -- applied to the bowling team for each (match, batting
     # team) row, i.e. whichever side wasn't batting.
     # ---------------------------------------------------------------
@@ -209,8 +225,8 @@ def batting_tab():
     # OWN pace_spin/bowl_style (who the batter actually faced), not the
     # batter's own bowling ability. This requires pulling ball-by-ball
     # data for every match still in scope, restricted to the (match,
-    # batting team) combinations that survived the Opponent filter above,
-    # with each ball's real bowler joined to their own style.
+    # batting team) combinations that survived the Team/Opponent filters
+    # above, with each ball's real bowler joined to their own style.
     # ---------------------------------------------------------------
     scoped_match_ids = tuple(str(m) for m in stage_df["match_id"].unique())
     deliveries_match_scope = get_deliveries_for_matches(scoped_match_ids)
@@ -284,7 +300,7 @@ def batting_tab():
     # Population base for the innings-grain sections further down
     # (Distribution of innings runs, Dismissal distribution vs population,
     # Boundary rate vs population, Metrics by batting position). These
-    # respect Grade/Match type/Season/Opponent but NOT the ball-level
+    # respect Grade/Match type/Season/Team/Opponent but NOT the ball-level
     # Bowling type/style filter -- an innings doesn't cleanly subset by
     # which bowler type was faced within it, so they're left at the
     # whole-innings player_innings grain rather than rebuilt from deliveries.
@@ -393,7 +409,7 @@ def batting_tab():
         )
 
         # Full (not bowler-style-filtered) ball-by-ball for this batter,
-        # within the Grade/Match type/Season/Opponent scope. Used to
+        # within the Grade/Match type/Season/Team/Opponent scope. Used to
         # compute the TRUE sequential ball position within each innings
         # (segment breakdown) and the complete vs-bowling-style picture --
         # both of which need the whole sequence/whole style spread, not
@@ -594,9 +610,9 @@ def batting_tab():
             )
 
             with st.expander(label):
-                # Already scoped to Grade/Season/Match type/Opponent AND
-                # the current Bowling type/style filter -- no re-filtering
-                # needed here, unlike the previous version of this tab.
+                # Already scoped to Grade/Season/Match type/Team/Opponent
+                # AND the current Bowling type/style filter -- no
+                # re-filtering needed here, unlike the previous version.
                 innings_balls = filtered_deliveries[
                     (filtered_deliveries["match_id"] == m_row["match_id"])
                     & (filtered_deliveries["innings_id"] == m_row["innings_id"])
@@ -665,7 +681,17 @@ def batting_tab():
 
         pop_innings = population_df
 
-        excluded_types = {"Did Not Bat", "did not bat", "DNB", "Not Out", "not out"}
+        # Retired / Retired Hurt / Retired Not Out excluded alongside the
+        # not-a-real-dismissal types, since none of them reflect the
+        # bowler/fielding side doing anything -- same reasoning as
+        # excluding Did Not Bat / Not Out.
+        excluded_types = {
+            "Did Not Bat", "did not bat", "DNB",
+            "Not Out", "not out",
+            "Retired", "retired",
+            "Retired Hurt", "retired hurt",
+            "Retired Not Out", "retired not out",
+        }
         pop_dismiss_df = pop_innings[
             pop_innings["dismissal_type"].notna()
             & ~pop_innings["dismissal_type"].isin(excluded_types)
@@ -700,17 +726,19 @@ def batting_tab():
             pop_pct = (pop_counts / pop_total * 100) if pop_total > 0 else pop_counts
             player_pct = (player_counts / player_total * 100) if player_total > 0 else player_counts
 
+            # Player columns/series come first -- both in the table and the
+            # chart -- per the "player stats first, then population" ask.
             comp_df = pd.DataFrame({
                 "dismissal_type": all_types,
-                "Population %": pop_pct.values,
-                "Population count": pop_counts.values,
                 "Player %": player_pct.values,
                 "Player count": player_counts.values,
+                "Population %": pop_pct.values,
+                "Population count": pop_counts.values,
             })
 
             comp_melt = comp_df.melt(
                 id_vars=["dismissal_type"],
-                value_vars=["Population %", "Player %"],
+                value_vars=["Player %", "Population %"],
                 var_name="group",
                 value_name="percentage",
             )
@@ -721,6 +749,7 @@ def batting_tab():
                 y="percentage",
                 color="group",
                 barmode="group",
+                category_orders={"group": ["Player %", "Population %"]},
                 title="Dismissal type % \u2014 player vs population",
                 color_discrete_sequence=MAROON_SHADES[:2],
             )
@@ -897,7 +926,12 @@ def batting_tab():
                     "selected_highlight_id" not in st.session_state
                     or st.session_state["selected_highlight_id"] not in h_sorted["highlight_id"].values
                 ):
+                    # A brand-new/reset selection (page load, or the
+                    # previous selection no longer exists under the current
+                    # filters) should NOT autoplay -- only an explicit
+                    # "Play" click should.
                     st.session_state["selected_highlight_id"] = default_id
+                    st.session_state["highlight_autoplay"] = False
 
                 list_col, video_col = st.columns([3, 2])
 
@@ -923,6 +957,10 @@ def batting_tab():
                             with row_btn_col:
                                 if st.button("\u25b6", key=f"play_{hl_id}"):
                                     st.session_state["selected_highlight_id"] = hl_id
+                                    # Explicit play request -- autoplay on
+                                    # the rerun this triggers, whether it's
+                                    # the same clip replayed or a new one.
+                                    st.session_state["highlight_autoplay"] = True
                             st.divider()
 
                 with video_col:
@@ -932,6 +970,11 @@ def batting_tab():
                     st.markdown(f"**{selected_highlight.get('description', '')}**")
                     url = selected_highlight.get("highlight_url")
                     if url:
-                        st.video(url, autoplay=True)
+                        # .pop() consumes the flag so autoplay only fires on
+                        # the ONE rerun immediately following a Play click --
+                        # any later, unrelated rerun (e.g. changing another
+                        # filter) defaults back to paused.
+                        autoplay = st.session_state.pop("highlight_autoplay", False)
+                        st.video(url, autoplay=autoplay)
                     else:
                         st.info("No video URL available for this highlight.")
