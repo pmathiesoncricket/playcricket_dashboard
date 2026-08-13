@@ -13,6 +13,15 @@ MAX_STREAM_GAP_HOURS = 18
 NBSP = "\u00A0"
 UNKNOWN_BOWL_LABEL = "Unknown / unrecorded"
 
+# Safety cap: get_batting_deliveries_summary() runs a GROUP BY over every
+# delivery in every match still in scope. Left unfiltered (e.g. no Grade or
+# Season selected), that can mean the WHOLE deliveries table, which can be
+# slow enough to hold a database connection open long enough to exhaust the
+# shared connection pool and time out unrelated queries for every user of
+# the app -- this happened in practice. Narrowing Grade/Season/Match type
+# below this many matches keeps that query fast and bounded.
+MAX_SCOPED_MATCHES_FOR_SUMMARY = 400
+
 
 def build_timestamped_youtube_url(base_url, seconds):
     """Build a YouTube URL timestamped to `seconds` into the stream, preserving
@@ -141,23 +150,26 @@ def batting_tab():
         return
     matches_df = add_season_column(matches_df, "day_1_start")
 
-    batting_df = get_batting_innings()
-    if batting_df.empty:
-        st.info("No batting data available.")
-        return
-    batting_df = add_season_column(batting_df, "day_1_start")
-
     st.sidebar.markdown("### Batting filters")
-    st.sidebar.caption("Filters are interdependent \u2014 each one narrows the options below it.")
+    st.sidebar.caption(
+        "Grade, Match type, Season, Team, and Opponent stay interactive as you narrow them. "
+        "Bowling type/style and the batting summary itself only load once you click "
+        "**Apply Filters** below, so a query doesn't fire on every small tweak."
+    )
 
     # ---------------------------------------------------------------
-    # Grade / Match type / Season -- applied at the match_id level: narrow
-    # the set of matches first, then restrict batting_df to that set.
+    # Grade / Match type / Season -- applied at the match_id level, using
+    # only the lightweight `matches` table, so this stays instantly
+    # interactive (and correctly cascading -- e.g. Season options only
+    # show seasons that grade was actually played in) without touching
+    # anything expensive.
     # ---------------------------------------------------------------
     stage_matches = matches_df.copy()
 
     grade_options = sorted(stage_matches["grade"].dropna().unique().tolist())
-    selected_grade = cascading_multiselect(st.sidebar, "Grade", grade_options, "filter_grade")
+    selected_grade = cascading_multiselect(
+        st.sidebar, "Grade", grade_options, "filter_grade", enable_quick_add=True
+    )
     if selected_grade:
         stage_matches = stage_matches[stage_matches["grade"].isin(selected_grade)]
 
@@ -177,36 +189,38 @@ def batting_tab():
         stage_matches = stage_matches[stage_matches["season"].isin(selected_season)]
 
     if stage_matches.empty:
-        st.warning("No matches match the current filters.")
+        st.sidebar.warning("No matches match Grade/Match type/Season.")
         return
 
     valid_match_ids = set(stage_matches["match_id"])
-    stage_df = batting_df[batting_df["match_id"].isin(valid_match_ids)].copy()
 
+    # ---------------------------------------------------------------
+    # Team / Opponent -- also stay live: player_innings is already cached
+    # by @st.cache_data, so re-slicing it as Team/Opponent change costs
+    # nothing extra beyond ordinary pandas filtering.
+    # ---------------------------------------------------------------
+    batting_df = get_batting_innings()
+    if batting_df.empty:
+        st.info("No batting data available.")
+        return
+    batting_df = add_season_column(batting_df, "day_1_start")
+
+    stage_df = batting_df[batting_df["match_id"].isin(valid_match_ids)].copy()
     if stage_df.empty:
-        st.warning("No batting records match the current filters.")
+        st.sidebar.warning("No batting records for the current Grade/Match type/Season.")
         return
 
-    # ---------------------------------------------------------------
-    # Team (batting team) -- multi-select so a club that's played under
-    # different names in different grades/seasons can be selected as one
-    # group. Applied directly to the batting-team column on each row.
-    # ---------------------------------------------------------------
     team_options = sorted(stage_df["team"].dropna().unique().tolist())
     selected_team = cascading_multiselect(
-        st.sidebar, "Team (batting team)", team_options, "filter_team"
+        st.sidebar, "Team (batting team)", team_options, "filter_team", enable_quick_add=True
     )
     if selected_team:
         stage_df = stage_df[stage_df["team"].isin(selected_team)]
 
     if stage_df.empty:
-        st.warning("No batting records match the current filters.")
+        st.sidebar.warning("No batting records match the current filters.")
         return
 
-    # ---------------------------------------------------------------
-    # Opponent -- applied to the bowling team for each (match, batting
-    # team) row, i.e. whichever side wasn't batting.
-    # ---------------------------------------------------------------
     opponent_options = sorted(stage_df["opponent_team"].dropna().unique().tolist())
     selected_opponent = cascading_multiselect(
         st.sidebar, "Opponent (bowling team)", opponent_options, "filter_opponent"
@@ -215,7 +229,44 @@ def batting_tab():
         stage_df = stage_df[stage_df["opponent_team"].isin(selected_opponent)]
 
     if stage_df.empty:
-        st.warning("No batting records match the current filters.")
+        st.sidebar.warning("No batting records match the current filters.")
+        return
+
+    scoped_match_ids = tuple(str(m) for m in stage_df["match_id"].unique())
+
+    # ---------------------------------------------------------------
+    # Apply Filters gate -- everything from here on (the ball-by-ball
+    # aggregate query, Bowling type/style, and the whole summary/detail
+    # page) only runs once the CURRENT Grade/Match type/Season/Team/
+    # Opponent combination has been explicitly applied. Changing any of
+    # those five afterward reverts the page back to "click Apply Filters"
+    # until you do, so it can never silently show stale results.
+    # ---------------------------------------------------------------
+    current_filter_key = (
+        tuple(sorted(selected_grade)), tuple(sorted(selected_match_type)), tuple(sorted(selected_season)),
+        tuple(sorted(selected_team)), tuple(sorted(selected_opponent)),
+    )
+
+    apply_clicked = st.sidebar.button("Apply Filters", type="primary", key="batting_apply_filters")
+    if apply_clicked:
+        st.session_state["batting_applied_key"] = current_filter_key
+
+    if st.session_state.get("batting_applied_key") != current_filter_key:
+        st.info(
+            "Set your Grade / Match type / Season / Team / Opponent filters in the sidebar, "
+            "then click **Apply Filters** to load the batting summary."
+        )
+        return
+
+    if len(scoped_match_ids) > MAX_SCOPED_MATCHES_FOR_SUMMARY:
+        st.warning(
+            f"{len(scoped_match_ids)} matches match these filters, which is over the "
+            f"{MAX_SCOPED_MATCHES_FOR_SUMMARY}-match limit for a single batting summary run. "
+            f"That's the point at which the underlying ball-by-ball query risks tying up the "
+            f"shared database connection for everyone using the app, so it's blocked outright "
+            f"rather than just being slow. Narrow Grade, Season, or Team above and click "
+            f"Apply Filters again."
+        )
         return
 
     # ---------------------------------------------------------------
@@ -225,9 +276,10 @@ def batting_tab():
     # summary (get_batting_deliveries_summary) rather than pulling raw
     # ball-by-ball rows for every match in scope -- Postgres does the
     # SUM/COUNT and only sends back one row per (match, innings, batting
-    # team, batter, bowler-style) combination, not one row per ball.
+    # team, batter, bowler-style) combination, not one row per ball. Once
+    # fetched (gated above), toggling these two filters is instant --
+    # they're just filtering this already-in-memory result.
     # ---------------------------------------------------------------
-    scoped_match_ids = tuple(str(m) for m in stage_df["match_id"].unique())
     agg_scope = get_batting_deliveries_summary(scoped_match_ids)
 
     if not agg_scope.empty:
