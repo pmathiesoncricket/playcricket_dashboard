@@ -292,6 +292,14 @@ def get_deliveries_for_match(match_id: str):
 
 @st.cache_data(ttl=300)
 def get_deliveries_for_matches(match_ids: tuple[str, ...]):
+    """
+    Bulk fetch of every raw delivery row for a set of matches. Still used
+    where genuine ball-by-ball detail is needed (Match Summary aggregate
+    view). For the Batting tab's per-batter summary table, prefer
+    get_batting_deliveries_summary() below -- it does the same job with a
+    fraction of the rows/columns crossing the network, since the
+    aggregation happens in Postgres instead of pandas.
+    """
     if not match_ids:
         return pd.DataFrame()
 
@@ -326,6 +334,65 @@ def get_deliveries_for_matches(match_ids: tuple[str, ...]):
     if not pages:
         return pd.DataFrame()
     return _stringify_uuids(pd.concat(pages, ignore_index=True))
+
+
+@st.cache_data(ttl=300)
+def get_batting_deliveries_summary(match_ids: tuple[str, ...]):
+    """
+    Server-side pre-aggregation of deliveries for the Batting tab's
+    per-batter summary table. Grouped by (match_id, innings_id,
+    batting_team_id, batter_id, bowler_pace_spin, bowler_bowl_style) so
+    Postgres does the GROUP BY (using the existing indexes on
+    deliveries.batter_id / match_id / bowler_id) and only the compact
+    aggregated rows -- one per unique combination, not one per ball --
+    cross the network. This is the same idea as a materialized/regular SQL
+    view, just expressed as a plain parameterized query instead of a
+    persistent database object: no schema migration, and no staleness
+    window to manage after a data load or a live-poll cycle, since it's
+    always computed fresh from whatever's currently in `deliveries`.
+
+    Each row = "this batter's totals, in this specific innings, against
+    bowlers with this specific pace_spin/bowl_style combination" -- fine
+    enough grain that filtering by Bowling type/style is just summing a
+    subset of these rows, but far coarser than raw deliveries (an innings
+    typically collapses from dozens of balls to a handful of rows here).
+    """
+    if not match_ids:
+        return pd.DataFrame()
+
+    params = {}
+    placeholders = []
+    for i, mid in enumerate(match_ids):
+        key = f"mid_{i}"
+        placeholders.append(f":{key}")
+        params[key] = mid
+    in_sql = ", ".join(placeholders)
+
+    sql = f"""
+        SELECT
+            d.match_id,
+            d.innings_id,
+            d.batting_team_id,
+            d.batter_id,
+            MAX(d.batter) AS batter_name,
+            ps.pace_spin AS bowler_pace_spin,
+            ps.bowl_style AS bowler_bowl_style,
+            SUM(d.batter_runs) AS runs,
+            COUNT(*) FILTER (WHERE d.wides = 0) AS legal_balls,
+            COUNT(*) FILTER (WHERE d.batter_runs = 4) AS fours,
+            COUNT(*) FILTER (WHERE d.batter_runs = 6) AS sixes,
+            COUNT(*) FILTER (
+                WHERE d.dismissal_type IS NOT NULL AND d.dismissed_player_id = d.batter_id
+            ) AS dismissals
+        FROM deliveries d
+        LEFT JOIN player_style ps ON d.bowler_id = ps.player_id
+        WHERE d.match_id IN ({in_sql}) AND d.batter_id IS NOT NULL
+        GROUP BY
+            d.match_id, d.innings_id, d.batting_team_id, d.batter_id,
+            ps.pace_spin, ps.bowl_style
+    """
+    df = _query_with_retry(sql, params=params, ttl=0)
+    return _stringify_uuids(df)
 
 
 @st.cache_data(ttl=300)
@@ -402,14 +469,7 @@ def get_wicket_deliveries():
 def get_highlights_for_bowlers(bowler_ids: tuple[str, ...], max_per_bowler: int = 10):
     """
     Up to `max_per_bowler` highlights per bowler, spread across as many
-    DIFFERENT MATCHES as possible: takes each bowler's first (earliest,
-    within-match) highlight from every distinct match they appear in
-    (most recent match first) before taking a second highlight from any
-    match -- i.e. 1 clip each from up to `max_per_bowler` different
-    matches, or 2 each if only half that many matches are available, etc.
-    This matters because video/stream quality varies match to match, so a
-    spread of matches gives a much better read on a bowler's action than
-    10 clips that all happen to come from the same one or two games.
+    DIFFERENT MATCHES as possible.
     """
     if not bowler_ids:
         return pd.DataFrame()
@@ -469,10 +529,7 @@ def get_highlights_for_bowlers(bowler_ids: tuple[str, ...], max_per_bowler: int 
 def get_highlights_for_batters(batter_ids: tuple[str, ...], max_per_batter: int = 10):
     """
     Up to `max_per_batter` highlights per batter, spread across as many
-    DIFFERENT MATCHES as possible -- mirrors get_highlights_for_bowlers()
-    exactly, just partitioned by batter_id instead. See that function's
-    docstring for why match-spread (rather than "10 most recent clips
-    regardless of match") matters here.
+    DIFFERENT MATCHES as possible.
     """
     if not batter_ids:
         return pd.DataFrame()
