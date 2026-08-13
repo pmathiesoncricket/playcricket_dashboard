@@ -120,6 +120,15 @@ def get_innings():
 
 @st.cache_data(ttl=300)
 def get_batting_innings():
+    """
+    Full, unscoped batting player_innings history joined to matches/style.
+    Kept for any caller that genuinely needs the whole dataset, but this
+    always pulls EVERY batting innings ever recorded regardless of any
+    Grade/Season/Team filter -- for a club with a few years of history,
+    that's a slow, unbounded query. The Batting tab should use
+    get_batting_innings_for_matches() below instead, which filters at the
+    SQL level to just the matches actually in scope.
+    """
     pi_df = fetch_all_rows("player_innings", "*", eq_filters={"role": "batting"})
 
     m_df = get_matches()
@@ -128,6 +137,69 @@ def get_batting_innings():
 
     ps_df = fetch_all_rows("player_style", "player_id, pace_spin, bowl_style")
 
+    pi_df = pi_df.merge(ps_df, on="player_id", how="left")
+
+    df = pi_df.merge(m_df, on="match_id", how="left")
+
+    df["opponent_team"] = None
+    mask_home = df["team"] == df["home_team"]
+    df.loc[mask_home, "opponent_team"] = df.loc[mask_home, "away_team"]
+    df.loc[~mask_home, "opponent_team"] = df.loc[~mask_home, "home_team"]
+
+    return df
+
+
+@st.cache_data(ttl=300)
+def get_batting_innings_for_matches(match_ids: tuple[str, ...]):
+    """
+    Same shape/joins/columns as get_batting_innings() (including
+    opponent_team), but filtered to a specific set of match_ids at the SQL
+    level via WHERE match_id IN (...), instead of fetching every batting
+    innings ever recorded and filtering in pandas afterward. This is what
+    the Batting tab now uses once Grade/Match type/Season have narrowed
+    down the match set, so the query cost scales with how much you've
+    actually filtered rather than always being "the whole club's history."
+    """
+    if not match_ids:
+        return pd.DataFrame()
+
+    params = {}
+    placeholders = []
+    for i, mid in enumerate(match_ids):
+        key = f"mid_{i}"
+        placeholders.append(f":{key}")
+        params[key] = mid
+    in_sql = ", ".join(placeholders)
+
+    pages = []
+    start = 0
+    page_size = 2000
+    while True:
+        params["limit"] = page_size
+        params["offset"] = start
+        sql = f"""
+            SELECT * FROM player_innings
+            WHERE role = 'batting' AND match_id IN ({in_sql})
+            ORDER BY match_id
+            LIMIT :limit OFFSET :offset
+        """
+        df_page = _query_with_retry(sql, params=params, ttl=0)
+        if df_page.empty:
+            break
+        pages.append(df_page)
+        if len(df_page) < page_size:
+            break
+        start += page_size
+
+    if not pages:
+        return pd.DataFrame()
+    pi_df = _stringify_uuids(pd.concat(pages, ignore_index=True))
+
+    m_df = get_matches()
+    if m_df.empty:
+        return pd.DataFrame()
+
+    ps_df = fetch_all_rows("player_style", "player_id, pace_spin, bowl_style")
     pi_df = pi_df.merge(ps_df, on="player_id", how="left")
 
     df = pi_df.merge(m_df, on="match_id", how="left")
@@ -345,17 +417,7 @@ def get_batting_deliveries_summary(match_ids: tuple[str, ...]):
     Postgres does the GROUP BY (using the existing indexes on
     deliveries.batter_id / match_id / bowler_id) and only the compact
     aggregated rows -- one per unique combination, not one per ball --
-    cross the network. This is the same idea as a materialized/regular SQL
-    view, just expressed as a plain parameterized query instead of a
-    persistent database object: no schema migration, and no staleness
-    window to manage after a data load or a live-poll cycle, since it's
-    always computed fresh from whatever's currently in `deliveries`.
-
-    Each row = "this batter's totals, in this specific innings, against
-    bowlers with this specific pace_spin/bowl_style combination" -- fine
-    enough grain that filtering by Bowling type/style is just summing a
-    subset of these rows, but far coarser than raw deliveries (an innings
-    typically collapses from dozens of balls to a handful of rows here).
+    cross the network.
     """
     if not match_ids:
         return pd.DataFrame()
