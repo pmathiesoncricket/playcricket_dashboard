@@ -219,11 +219,24 @@ def batting_tab():
         ["player_name", "innings", "total_runs", "average", "strike_rate", "BPD", "fours", "sixes"]
     ].sort_values("total_runs", ascending=False).reset_index(drop=True)
 
-    # Size the table to the actual number of rows (capped at 10) so a
-    # single-batter selection doesn't leave a block of empty blank rows.
-    MAX_ROWS_VISIBLE = 10
+    # FIX: the table's pixel height was previously capped at MAX_ROWS_VISIBLE
+    # (10) rows' worth regardless of how many batters actually matched the
+    # filters -- the extra rows were still in summary_table and technically
+    # reachable by scrolling inside the widget, but with a fixed ~10-row
+    # viewport it was very easy to mistake that for "the filter dropped some
+    # batters" when nothing was actually excluded from the data. Raising the
+    # cap means most realistic "a few grades" selections show in full without
+    # scrolling; the caption below also states the true count so it's never
+    # ambiguous, and very large unfiltered lists still scroll rather than
+    # blowing out the page height.
+    MAX_ROWS_VISIBLE = 25
     rows_to_show = min(len(summary_table), MAX_ROWS_VISIBLE)
     TABLE_HEIGHT = (rows_to_show + 1) * 35 + 3
+
+    st.caption(
+        f"{len(summary_table)} batter(s) match the current filters."
+        + (" Scroll within the table below to see all of them." if len(summary_table) > MAX_ROWS_VISIBLE else "")
+    )
 
     summary_event = st.dataframe(
         summary_table,
