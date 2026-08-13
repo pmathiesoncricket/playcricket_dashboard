@@ -160,11 +160,6 @@ def batting_tab():
     matches_df = add_season_column(matches_df, "day_1_start")
 
     st.sidebar.markdown("### Batting filters")
-    st.sidebar.caption(
-        "Grade, Match type, and Season are always instant. Click **Apply Filters** to load "
-        "the batting data itself -- after that, Team, Opponent, Bowling type and Bowling "
-        "style all become available and update live."
-    )
 
     stage_matches = matches_df.copy()
 
@@ -747,16 +742,22 @@ def batting_tab():
 
         pop_innings = population_df
 
-        # Retired / Retired Hurt / Retired Not Out excluded alongside the
-        # not-a-real-dismissal types, since none of them reflect the
-        # bowler/fielding side doing anything -- same reasoning as
-        # excluding Did Not Bat / Not Out.
+        # Excludes not-a-real-dismissal types (Did Not Bat/Not Out) and
+        # every Retired variant (nobody on the bowling/fielding side did
+        # anything), plus Hit Wicket and Handled Ball -- freak/self-inflicted
+        # dismissals that don't reflect the bowler/fielding side's doing
+        # either, so they're excluded from this specific type breakdown for
+        # the same reason (they're still credited as bowler wickets
+        # elsewhere in the app where that distinction matters -- this
+        # exclusion list is specific to this distribution view).
         excluded_types = {
             "Did Not Bat", "did not bat", "DNB",
             "Not Out", "not out",
             "Retired", "retired",
             "Retired Hurt", "retired hurt",
             "Retired Not Out", "retired not out",
+            "Hit Wicket", "hit wicket",
+            "Handled Ball", "handled ball", "Handled the Ball", "handled the ball",
         }
         pop_dismiss_df = pop_innings[
             pop_innings["dismissal_type"].notna()
