@@ -4,7 +4,8 @@ import plotly.express as px
 from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
 
 from db import (
-    get_batting_innings, get_deliveries_for_matches, get_highlights, get_matches, get_player_style,
+    get_batting_innings, get_batting_deliveries_summary, get_deliveries_for_batter,
+    get_highlights, get_matches, get_player_style,
 )
 from helpers import add_season_column, cascading_multiselect, segment_label, SEGMENT_ORDER, MAROON, MAROON_SHADES
 
@@ -82,32 +83,32 @@ def _pad(text, width):
     return text + NBSP * (width - len(text))
 
 
-def _apply_bowler_style_filter(deliveries_df, column, selected_values):
+def _apply_bowler_style_filter(df, column, selected_values):
     """
-    Filters deliveries by the ACTUAL bowler's own pace_spin/bowl_style
-    (joined via deliveries.bowler_id -> player_style.player_id) -- i.e.
+    Filters rows by the ACTUAL bowler's own pace_spin/bowl_style (already
+    joined onto whichever dataframe is passed in via bowler_id) -- i.e.
     who the batter faced, not the batter's own bowling ability.
-    UNKNOWN_BOWL_LABEL is a selectable bucket covering any ball where the
+    UNKNOWN_BOWL_LABEL is a selectable bucket covering any row where the
     bowler has no recorded style, so incomplete style data doesn't
-    silently drop deliveries when "everything" is selected (the default).
+    silently drop rows when "everything" is selected (the default).
     """
     if not selected_values:
-        return deliveries_df
-    mask = deliveries_df[column].isin(selected_values)
+        return df
+    mask = df[column].isin(selected_values)
     if UNKNOWN_BOWL_LABEL in selected_values:
-        mask = mask | deliveries_df[column].isna()
-    return deliveries_df[mask]
+        mask = mask | df[column].isna()
+    return df[mask]
 
 
-def _summary_from_deliveries(d):
+def _summary_from_aggregated(d):
     """
-    Per-batter Batting summary figures computed straight from ball-by-ball
-    data (already scoped/filtered by the caller), rather than from
-    whole-innings player_innings totals -- necessary because the Bowling
-    type/style filters now operate at the ball level, and an innings can
-    include balls against several different bowler types. Runs/fours/sixes
-    always come from batter_runs (never team_runs, which also includes
-    byes/leg-byes/extras that aren't the batter's own runs).
+    Per-batter Batting summary figures, built from the PRE-AGGREGATED
+    get_batting_deliveries_summary() result (one row per match/innings/
+    batting-team/batter/bowler-style combo) rather than raw ball-by-ball
+    data -- Postgres already did the SUM/COUNT server-side, this just
+    rolls those rows up to one row per batter. Runs/fours/sixes/dismissals
+    all originate from batter_runs / dismissed_player_id in that query
+    (never team_runs).
     """
     columns = ["player_id", "player_name", "innings", "total_runs", "total_balls", "dismissals", "fours", "sixes"]
     if d.empty:
@@ -118,18 +119,15 @@ def _summary_from_deliveries(d):
         .groupby("batter_id").size().reset_index(name="innings")
     )
     totals = d.groupby("batter_id").agg(
-        player_name=("batter", "first"),
-        total_runs=("batter_runs", "sum"),
-        fours=("is_four", "sum"),
-        sixes=("is_six", "sum"),
-        dismissals=("is_dismissal", "sum"),
+        player_name=("batter_name", "first"),
+        total_runs=("runs", "sum"),
+        total_balls=("legal_balls", "sum"),
+        fours=("fours", "sum"),
+        sixes=("sixes", "sum"),
+        dismissals=("dismissals", "sum"),
     ).reset_index()
-    balls = (
-        d[d["is_legal_for_batter"]].groupby("batter_id").size().reset_index(name="total_balls")
-    )
 
-    g = totals.merge(innings_counts, on="batter_id", how="left").merge(balls, on="batter_id", how="left")
-    g["total_balls"] = g["total_balls"].fillna(0).astype(int)
+    g = totals.merge(innings_counts, on="batter_id", how="left")
     g["innings"] = g["innings"].fillna(0).astype(int)
     return g.rename(columns={"batter_id": "player_id"})[columns]
 
@@ -223,70 +221,54 @@ def batting_tab():
     # ---------------------------------------------------------------
     # Bowling type / Bowling style -- applied to deliveries.bowler_id's
     # OWN pace_spin/bowl_style (who the batter actually faced), not the
-    # batter's own bowling ability. This requires pulling ball-by-ball
-    # data for every match still in scope, restricted to the (match,
-    # batting team) combinations that survived the Team/Opponent filters
-    # above, with each ball's real bowler joined to their own style.
+    # batter's own bowling ability. Uses the pre-aggregated, server-side
+    # summary (get_batting_deliveries_summary) rather than pulling raw
+    # ball-by-ball rows for every match in scope -- Postgres does the
+    # SUM/COUNT and only sends back one row per (match, innings, batting
+    # team, batter, bowler-style) combination, not one row per ball.
     # ---------------------------------------------------------------
     scoped_match_ids = tuple(str(m) for m in stage_df["match_id"].unique())
-    deliveries_match_scope = get_deliveries_for_matches(scoped_match_ids)
+    agg_scope = get_batting_deliveries_summary(scoped_match_ids)
 
-    if not deliveries_match_scope.empty:
+    if not agg_scope.empty:
         valid_team_keys = stage_df[["match_id", "team_id"]].drop_duplicates()
-        deliveries_match_scope = deliveries_match_scope.merge(
+        agg_scope = agg_scope.merge(
             valid_team_keys,
             left_on=["match_id", "batting_team_id"],
             right_on=["match_id", "team_id"],
             how="inner",
         )
-        bowler_style_lookup = get_player_style()[["player_id", "pace_spin", "bowl_style"]].rename(
-            columns={"player_id": "bowler_id", "pace_spin": "bowler_pace_spin", "bowl_style": "bowler_bowl_style"}
-        )
-        deliveries_match_scope = deliveries_match_scope.merge(bowler_style_lookup, on="bowler_id", how="left")
     else:
-        deliveries_match_scope["bowler_pace_spin"] = pd.Series(dtype="object")
-        deliveries_match_scope["bowler_bowl_style"] = pd.Series(dtype="object")
+        agg_scope["bowler_pace_spin"] = pd.Series(dtype="object")
+        agg_scope["bowler_bowl_style"] = pd.Series(dtype="object")
 
-    if deliveries_match_scope.empty:
+    if agg_scope.empty:
         st.warning("No ball-by-ball data available for the current filters.")
         return
 
-    deliveries_match_scope["wides"] = deliveries_match_scope["wides"].fillna(0)
-    deliveries_match_scope["is_legal_for_batter"] = deliveries_match_scope["wides"] == 0
-    deliveries_match_scope["is_dismissal"] = (
-        deliveries_match_scope["dismissal_type"].notna()
-        & (deliveries_match_scope["dismissed_player_id"] == deliveries_match_scope["batter_id"])
-    )
-    deliveries_match_scope["is_four"] = deliveries_match_scope["batter_runs"] == 4
-    deliveries_match_scope["is_six"] = deliveries_match_scope["batter_runs"] == 6
-
     bowling_type_options = (
-        sorted(deliveries_match_scope["bowler_pace_spin"].dropna().unique().tolist()) + [UNKNOWN_BOWL_LABEL]
+        sorted(agg_scope["bowler_pace_spin"].dropna().unique().tolist()) + [UNKNOWN_BOWL_LABEL]
     )
     selected_bowling_type = cascading_multiselect(
         st.sidebar, "Bowling type (pace/spin)", bowling_type_options, "filter_bowling_type",
         default_options=bowling_type_options,
     )
-    deliveries_after_type = _apply_bowler_style_filter(
-        deliveries_match_scope, "bowler_pace_spin", selected_bowling_type
-    )
+    agg_after_type = _apply_bowler_style_filter(agg_scope, "bowler_pace_spin", selected_bowling_type)
 
     bowl_style_options = (
-        sorted(deliveries_after_type["bowler_bowl_style"].dropna().unique().tolist()) + [UNKNOWN_BOWL_LABEL]
+        sorted(agg_after_type["bowler_bowl_style"].dropna().unique().tolist()) + [UNKNOWN_BOWL_LABEL]
     )
     selected_bowl_style = cascading_multiselect(
         st.sidebar, "Bowling style", bowl_style_options, "filter_bowl_style",
         default_options=bowl_style_options,
     )
-    deliveries_scope = _apply_bowler_style_filter(
-        deliveries_after_type, "bowler_bowl_style", selected_bowl_style
-    )
+    agg_filtered = _apply_bowler_style_filter(agg_after_type, "bowler_bowl_style", selected_bowl_style)
 
-    if deliveries_scope.empty:
+    if agg_filtered.empty:
         st.warning("No ball-by-ball data matches the current filters.")
         return
 
-    grouped_all = _summary_from_deliveries(deliveries_scope)
+    grouped_all = _summary_from_aggregated(agg_filtered)
     batter_options = sorted(grouped_all["player_name"].dropna().tolist())
 
     if "pending_batter_filter" in st.session_state:
@@ -315,19 +297,19 @@ def batting_tab():
     )
 
     selected_batter_id = None
-    filtered_deliveries = deliveries_scope
+    filtered_agg = agg_filtered
     filtered = stage_df
     if selected_batter_name != "All batters":
         batter_row = grouped_all[grouped_all["player_name"] == selected_batter_name].iloc[0]
         selected_batter_id = batter_row["player_id"]
-        filtered_deliveries = deliveries_scope[deliveries_scope["batter_id"] == str(selected_batter_id)]
+        filtered_agg = agg_filtered[agg_filtered["batter_id"] == str(selected_batter_id)]
         filtered = stage_df[stage_df["player_id"] == selected_batter_id]
 
-    if filtered_deliveries.empty:
+    if filtered_agg.empty:
         st.warning("No batting records match the current filters.")
         return
 
-    grouped = _summary_from_deliveries(filtered_deliveries)
+    grouped = _summary_from_aggregated(filtered_agg)
 
     grouped["average"] = grouped.apply(
         lambda row: row["total_runs"] / row["dismissals"] if row["dismissals"] > 0 else None,
@@ -408,18 +390,38 @@ def batting_tab():
             f"{selected_row['strike_rate']:.0f}" if pd.notna(selected_row["strike_rate"]) else "\u2013",
         )
 
-        # Full (not bowler-style-filtered) ball-by-ball for this batter,
-        # within the Grade/Match type/Season/Team/Opponent scope. Used to
-        # compute the TRUE sequential ball position within each innings
-        # (segment breakdown) and the complete vs-bowling-style picture --
-        # both of which need the whole sequence/whole style spread, not
-        # just the subset matching the sidebar's own Bowling type/style
-        # selection. The sidebar filter is then applied on top where it
-        # actually makes sense (segment aggregates), while leaving the
-        # vs-bowling-style table showing every style for comparison.
-        full_batter_deliveries = deliveries_match_scope[
-            deliveries_match_scope["batter_id"] == str(selected_batter_id)
-        ].copy()
+        # From here on, sections drill into ONE batter's ball-by-ball data
+        # (video links, over/ball numbering, free-text descriptions) --
+        # that's cheap to fetch directly for a single player, so we no
+        # longer need the heavier match-wide aggregate used for the
+        # summary table above.
+        full_batter_deliveries = get_deliveries_for_batter(str(selected_batter_id))
+        if not full_batter_deliveries.empty:
+            full_batter_deliveries = full_batter_deliveries.copy()
+            full_batter_deliveries["wides"] = full_batter_deliveries["wides"].fillna(0)
+            full_batter_deliveries["is_legal_for_batter"] = full_batter_deliveries["wides"] == 0
+            full_batter_deliveries["is_dismissal"] = (
+                full_batter_deliveries["dismissal_type"].notna()
+                & (full_batter_deliveries["dismissed_player_id"] == full_batter_deliveries["batter_id"])
+            )
+            full_batter_deliveries["is_four"] = full_batter_deliveries["batter_runs"] == 4
+            full_batter_deliveries["is_six"] = full_batter_deliveries["batter_runs"] == 6
+
+            bowler_style_lookup = get_player_style()[["player_id", "pace_spin", "bowl_style"]].rename(
+                columns={"player_id": "bowler_id", "pace_spin": "bowler_pace_spin", "bowl_style": "bowler_bowl_style"}
+            )
+            full_batter_deliveries = full_batter_deliveries.merge(bowler_style_lookup, on="bowler_id", how="left")
+
+            # Restrict to the current Grade/Match type/Season/Team/Opponent
+            # scope (get_deliveries_for_batter returns this batter's whole
+            # history, unfiltered).
+            valid_team_keys = stage_df[["match_id", "team_id"]].drop_duplicates()
+            full_batter_deliveries = full_batter_deliveries.merge(
+                valid_team_keys,
+                left_on=["match_id", "batting_team_id"],
+                right_on=["match_id", "team_id"],
+                how="inner",
+            )
 
         st.subheader("Ball\u2011segment breakdown (deliveries)")
 
@@ -548,12 +550,12 @@ def batting_tab():
 
         # Which (match, innings) show up is restricted to those where this
         # batter faced at least one delivery matching the current Bowling
-        # type/style filter (filtered_deliveries); the RUNS/BALLS/SR shown
-        # in each row's label are the batter's TRUE full-innings figures
-        # from player_innings, since bowler-style filtering doesn't cleanly
-        # subset "which innings" -- only "which balls within it".
+        # type/style filter; the RUNS/BALLS/SR shown in each row's label
+        # are the batter's TRUE full-innings figures from player_innings,
+        # since bowler-style filtering doesn't cleanly subset "which
+        # innings" -- only "which balls within it".
         qualifying_innings = (
-            filtered_deliveries[["match_id", "innings_id"]].drop_duplicates()
+            filtered_agg[["match_id", "innings_id"]].drop_duplicates()
             if selected_batter_id is not None else pd.DataFrame(columns=["match_id", "innings_id"])
         )
 
@@ -610,13 +612,19 @@ def batting_tab():
             )
 
             with st.expander(label):
-                # Already scoped to Grade/Season/Match type/Team/Opponent
-                # AND the current Bowling type/style filter -- no
-                # re-filtering needed here, unlike the previous version.
-                innings_balls = filtered_deliveries[
-                    (filtered_deliveries["match_id"] == m_row["match_id"])
-                    & (filtered_deliveries["innings_id"] == m_row["innings_id"])
+                if full_batter_deliveries.empty:
+                    st.info("No ball-by-ball data available for this innings.")
+                    continue
+
+                innings_balls = full_batter_deliveries[
+                    (full_batter_deliveries["match_id"] == m_row["match_id"])
+                    & (full_batter_deliveries["innings_id"] == m_row["innings_id"])
                 ].copy()
+
+                # Apply the sidebar Bowling type/style filter to the
+                # ball-by-ball listing shown here.
+                innings_balls = _apply_bowler_style_filter(innings_balls, "bowler_pace_spin", selected_bowling_type)
+                innings_balls = _apply_bowler_style_filter(innings_balls, "bowler_bowl_style", selected_bowl_style)
 
                 if innings_balls.empty:
                     st.info("No ball-by-ball data available for this innings (with current bowling filters).")
