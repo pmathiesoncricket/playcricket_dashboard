@@ -4,7 +4,7 @@ import plotly.express as px
 from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
 
 from db import (
-    get_batting_innings, get_batting_deliveries_summary, get_deliveries_for_batter,
+    get_batting_innings_for_matches, get_batting_deliveries_summary, get_deliveries_for_batter,
     get_highlights, get_matches, get_player_style,
 )
 from helpers import add_season_column, cascading_multiselect, segment_label, SEGMENT_ORDER, MAROON, MAROON_SHADES
@@ -13,13 +13,15 @@ MAX_STREAM_GAP_HOURS = 18
 NBSP = "\u00A0"
 UNKNOWN_BOWL_LABEL = "Unknown / unrecorded"
 
-# Safety cap: get_batting_deliveries_summary() runs a GROUP BY over every
-# delivery in every match still in scope. Left unfiltered (e.g. no Grade or
-# Season selected), that can mean the WHOLE deliveries table, which can be
-# slow enough to hold a database connection open long enough to exhaust the
-# shared connection pool and time out unrelated queries for every user of
-# the app -- this happened in practice. Narrowing Grade/Season/Match type
-# below this many matches keeps that query fast and bounded.
+# Safety cap, checked as soon as Grade/Match type/Season resolve to a
+# match set (before ANY of the heavier per-match queries run). Left
+# unfiltered, both get_batting_innings_for_matches() and
+# get_batting_deliveries_summary() scale with how many matches are in
+# scope -- a large enough selection can be slow enough to hold a database
+# connection open long enough to exhaust the shared connection pool and
+# time out unrelated queries for every user of the app. Narrowing
+# Grade/Season/Match type below this many matches keeps both queries fast
+# and bounded.
 MAX_SCOPED_MATCHES_FOR_SUMMARY = 400
 
 
@@ -196,13 +198,10 @@ def batting_tab():
 
     # ---------------------------------------------------------------
     # Apply Filters gate -- ONLY Grade/Match type/Season decide whether
-    # get_batting_innings() (a genuinely expensive fetch of the whole
-    # batting history, even though it's cached -- caching only helps on
-    # a WARM cache, not the first hit) is allowed to run. Nothing past
-    # this point executes until the current Grade/Match type/Season
-    # combination has been explicitly applied; changing any of those
-    # three afterward reverts the page back to "click Apply Filters"
-    # until you do, so it can never load stale data.
+    # get_batting_innings_for_matches() runs. Nothing past this point
+    # executes until the current Grade/Match type/Season combination has
+    # been explicitly applied; changing any of those three afterward
+    # reverts the page back to "click Apply Filters" until you do.
     # ---------------------------------------------------------------
     current_filter_key = (
         tuple(sorted(selected_grade)), tuple(sorted(selected_match_type)), tuple(sorted(selected_season)),
@@ -220,21 +219,37 @@ def batting_tab():
         return
 
     # ---------------------------------------------------------------
-    # Team / Opponent -- only computed/shown AFTER Apply Filters, since
-    # they depend on get_batting_innings(). Once loaded, both stay live
-    # (no need to click Apply again) since they only ever narrow the
-    # match set further, never past the cap already enforced below.
+    # SAFETY CAP -- checked immediately, before EITHER of the two heavy
+    # per-match queries (player_innings fetch, deliveries aggregate) runs.
+    # Team/Opponent (applied after this point) can only narrow the match
+    # set further, never grow it past what's checked here.
     # ---------------------------------------------------------------
-    batting_df = get_batting_innings()
-    if batting_df.empty:
-        st.info("No batting data available.")
+    if len(valid_match_ids) > MAX_SCOPED_MATCHES_FOR_SUMMARY:
+        st.warning(
+            f"{len(valid_match_ids)} matches match Grade/Match type/Season, which is over the "
+            f"{MAX_SCOPED_MATCHES_FOR_SUMMARY}-match limit for a single batting summary run. "
+            f"That's the point at which the underlying queries risk being slow enough to tie up "
+            f"the shared database connection for everyone using the app, so it's blocked "
+            f"outright rather than just being slow. Narrow Grade or Season above and click "
+            f"Apply Filters again."
+        )
         return
-    batting_df = add_season_column(batting_df, "day_1_start")
 
-    stage_df = batting_df[batting_df["match_id"].isin(valid_match_ids)].copy()
+    # ---------------------------------------------------------------
+    # Team / Opponent -- only computed/shown AFTER Apply Filters, and now
+    # scoped at the SQL level via get_batting_innings_for_matches() (which
+    # filters WHERE match_id IN (...) instead of fetching every batting
+    # innings ever recorded and filtering in pandas afterward). Once
+    # loaded, both stay live (no need to click Apply again) since they
+    # only ever narrow the match set further, never past the cap already
+    # enforced above.
+    # ---------------------------------------------------------------
+    scoped_match_ids_for_batting = tuple(str(m) for m in valid_match_ids)
+    stage_df = get_batting_innings_for_matches(scoped_match_ids_for_batting)
     if stage_df.empty:
-        st.sidebar.warning("No batting records for the current Grade/Match type/Season.")
+        st.info("No batting data available for the current Grade/Match type/Season.")
         return
+    stage_df = add_season_column(stage_df, "day_1_start")
 
     team_options = sorted(stage_df["team"].dropna().unique().tolist())
     selected_team = cascading_multiselect(
@@ -259,16 +274,6 @@ def batting_tab():
         return
 
     scoped_match_ids = tuple(str(m) for m in stage_df["match_id"].unique())
-
-    if len(scoped_match_ids) > MAX_SCOPED_MATCHES_FOR_SUMMARY:
-        st.warning(
-            f"{len(scoped_match_ids)} matches match these filters, which is over the "
-            f"{MAX_SCOPED_MATCHES_FOR_SUMMARY}-match limit for a single batting summary run. "
-            f"That's the point at which the underlying ball-by-ball query risks tying up the "
-            f"shared database connection for everyone using the app, so it's blocked outright "
-            f"rather than just being slow. Narrow Grade, Season, or Team above."
-        )
-        return
 
     # ---------------------------------------------------------------
     # Bowling type / Bowling style -- applied to deliveries.bowler_id's
