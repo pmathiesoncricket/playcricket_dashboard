@@ -3,9 +3,9 @@ import pandas as pd
 import plotly.express as px
 
 from db import (
-    get_bowling_innings, get_batting_innings, get_deliveries_for_bowler,
-    get_bowling_conceded_summary, get_wicket_deliveries, get_highlights,
-    get_matches, get_player_style,
+    get_matches, get_bowling_innings_for_matches, get_batting_innings_for_matches,
+    get_deliveries_for_bowler, get_bowling_conceded_summary, get_wicket_deliveries,
+    get_highlights, get_player_style,
 )
 from helpers import add_season_column, cascading_multiselect, MAROON, MAROON_SHADES
 # Reuse the exact YouTube-timestamping / label-padding machinery already
@@ -14,19 +14,16 @@ from tab_batting import build_timestamped_youtube_url, resolve_ball_video_url, _
 
 DASH = "\u2013"
 
-# Dismissal types NOT credited as a wicket to the bowler (case-insensitive
-# substring match, so it also catches "Retired Not Out", "Retired Hurt",
-# "Obstructing the Field", etc).
-WICKET_EXCLUDE_PATTERNS = ["run out", "retired", "obstruct"]
+# Safety cap, checked as soon as Grade/Match type/Season resolve to a match
+# set (before the scoped bowling-innings fetch runs). Same idea as the
+# Batting tab: an unbounded selection could be slow enough to hold a
+# database connection open long enough to exhaust the shared pool for
+# every user of the app.
+MAX_SCOPED_MATCHES = 400
 
-# Dismissal types excluded from the dismissal-type DISTRIBUTION chart (a
-# different, narrower exclusion list than the wicket-credit rule above --
-# this one also drops Hit Wicket and Hit the Ball Twice, which ARE still
-# credited as bowler wickets, just not shown in this particular type
-# breakdown).
+WICKET_EXCLUDE_PATTERNS = ["run out", "retired", "obstruct"]
 DISMISSAL_DIST_EXCLUDE_PATTERNS = ["hit wicket", "ball twice", "obstruct", "retired", "run out"]
 
-# Over ranges are inclusive, matching deliveries.over as-is (40-over cricket)
 PHASES = [
     ("Powerplay (0-9)", 0, 9),
     ("Middle (10-29)", 10, 29),
@@ -61,9 +58,6 @@ def is_countable_dismissal(dismissal_type):
 
 
 def overs_to_balls(overs):
-    """Converts cricket-notation overs (e.g. 4.3 = 4 overs, 3 balls) to a
-    total ball count. Assumes the numeric(6,1) `overs` column stores the
-    ball-in-over digit directly (0-5) in its single decimal place."""
     if pd.isna(overs):
         return 0
     overs = float(overs)
@@ -91,8 +85,6 @@ def _position_bucket(pos):
 
 
 def _legal_deliveries(deliveries_df):
-    """Legal balls only: exclude wides AND no-balls (matches the same
-    convention used for bowling economy elsewhere in this app)."""
     d = deliveries_df.copy()
     d["wides"] = d["wides"].fillna(0)
     d["no_balls"] = d["no_balls"].fillna(0)
@@ -100,12 +92,6 @@ def _legal_deliveries(deliveries_df):
 
 
 def _prep_bowling_deliveries(deliveries_df):
-    """Adds the derived per-ball columns every bowling breakdown in this
-    tab depends on: is_legal, runs_charged, is_wicket, is_four, is_six,
-    is_scoring. Fours/sixes are identified by batter_runs == 4 / 6 (runs
-    actually scored off the bat) -- not by parsing the free-text
-    `description` column, which doesn't reliably contain "FOUR"/"SIX" and
-    was previously causing every boundary figure on this tab to read 0."""
     d = _legal_deliveries(deliveries_df)
     d["is_legal"] = (d["wides"] == 0) & (d["no_balls"] == 0)
     if "bowler_runs" in d.columns:
@@ -121,11 +107,6 @@ def _prep_bowling_deliveries(deliveries_df):
 
 
 def _bowling_metrics(df, group_cols):
-    """Core bowling metrics from prepped ball-by-ball data, grouped by
-    `group_cols`: average/economy/BPD from wickets/runs/balls, plus
-    Balls Per Boundary (BPB) and Scoring Shot % in place of raw
-    fours/sixes counts (which read misleadingly small/zero once split
-    across many thin category buckets)."""
     if isinstance(group_cols, str):
         group_cols = [group_cols]
     g = df.groupby(group_cols, dropna=False).agg(
@@ -148,14 +129,6 @@ def _bowling_metrics(df, group_cols):
 
 
 def _render_metrics_table(df, category_col, category_label, sort_col="wickets"):
-    """Renders a bowling-metrics table. Sorting is done BEFORE the display
-    rename (sorting after rename was the source of a KeyError, since
-    "wickets"/the category column no longer existed under their original
-    names post-rename). When sort_col is the category column itself
-    (e.g. an ordered phase/position categorical), we sort ascending to
-    preserve its natural order; otherwise (e.g. "wickets") we sort
-    descending so the best performers show first.
-    """
     disp = df.copy()
     ascending = sort_col == category_col
     disp = disp.sort_values(sort_col, ascending=ascending)
@@ -180,46 +153,105 @@ def _render_metrics_table(df, category_col, category_label, sort_col="wickets"):
 def bowling_tab():
     st.header("Bowling")
 
-    bowling_df = get_bowling_innings()
-    if bowling_df.empty:
-        st.info("No bowling data available.")
-        return
-
-    bowling_df = add_season_column(bowling_df, "day_1_start")
+    # ---------------------------------------------------------------
+    # Grade / Match type / Season -- the ONLY things fetched/computed
+    # before Apply Filters is clicked. This uses just the lightweight
+    # `matches` table, so the page stays instantly interactive without
+    # touching get_bowling_innings_for_matches (a genuinely expensive
+    # fetch once scoped to more than a handful of matches).
+    # ---------------------------------------------------------------
     matches_df = get_matches()
+    if matches_df.empty:
+        st.info("No match data available.")
+        return
+    matches_df = add_season_column(matches_df, "day_1_start")
 
     st.sidebar.markdown("### Bowling filters")
-    st.sidebar.caption("Filters are interdependent \u2014 each one narrows the options below it.")
+    st.sidebar.caption(
+        "Grade, Match type, and Season are always instant. Click **Apply Filters** to load "
+        "the bowling data itself -- after that, Bowling type, Bowling style, Batter hand and "
+        "Opponent all become available and update live."
+    )
 
-    stage_df = bowling_df.copy()
+    stage_matches = matches_df.copy()
 
-    grade_options = sorted(stage_df["grade"].dropna().unique().tolist())
+    grade_options = sorted(stage_matches["grade"].dropna().unique().tolist())
     selected_grade = cascading_multiselect(
-        st.sidebar, "Grade", grade_options, "bowl_filter_grade"
+        st.sidebar, "Grade", grade_options, "bowl_filter_grade", enable_quick_add=True
     )
     if selected_grade:
-        stage_df = stage_df[stage_df["grade"].isin(selected_grade)]
+        stage_matches = stage_matches[stage_matches["grade"].isin(selected_grade)]
 
-    match_type_options = sorted(stage_df["match_type"].dropna().unique().tolist())
+    match_type_options = sorted(stage_matches["match_type"].dropna().unique().tolist())
     selected_match_type = cascading_multiselect(
         st.sidebar, "Match type", match_type_options, "bowl_filter_match_type",
         default_options=match_type_options,
     )
     if selected_match_type:
-        stage_df = stage_df[stage_df["match_type"].isin(selected_match_type)]
+        stage_matches = stage_matches[stage_matches["match_type"].isin(selected_match_type)]
 
     season_options = (
-        stage_df["season"]
-        .dropna()
-        .drop_duplicates()
-        .sort_values(ascending=False)
-        .tolist()
+        stage_matches["season"].dropna().drop_duplicates().sort_values(ascending=False).tolist()
     )
     selected_season = cascading_multiselect(
         st.sidebar, "Season (July\u2013June)", season_options, "bowl_filter_season"
     )
     if selected_season:
-        stage_df = stage_df[stage_df["season"].isin(selected_season)]
+        stage_matches = stage_matches[stage_matches["season"].isin(selected_season)]
+
+    if stage_matches.empty:
+        st.sidebar.warning("No matches match Grade/Match type/Season.")
+        return
+
+    valid_match_ids = set(stage_matches["match_id"])
+
+    # ---------------------------------------------------------------
+    # Apply Filters gate -- ONLY Grade/Match type/Season decide whether
+    # get_bowling_innings_for_matches() runs. Nothing past this point
+    # executes until the current combination has been explicitly applied;
+    # changing any of those three afterward reverts the page back to
+    # "click Apply Filters" until you do, so it can never show stale data.
+    # ---------------------------------------------------------------
+    current_filter_key = (
+        tuple(sorted(selected_grade)), tuple(sorted(selected_match_type)), tuple(sorted(selected_season)),
+    )
+
+    apply_clicked = st.sidebar.button("Apply Filters", type="primary", key="bowl_apply_filters")
+    if apply_clicked:
+        st.session_state["bowl_applied_key"] = current_filter_key
+
+    if st.session_state.get("bowl_applied_key") != current_filter_key:
+        st.info(
+            "Set your Grade / Match type / Season filters in the sidebar, then click "
+            "**Apply Filters** to load the bowling data."
+        )
+        return
+
+    if len(valid_match_ids) > MAX_SCOPED_MATCHES:
+        st.warning(
+            f"{len(valid_match_ids)} matches match Grade/Match type/Season, which is over the "
+            f"{MAX_SCOPED_MATCHES}-match limit for a single Bowling report run. That's the point "
+            f"at which the underlying queries risk being slow enough to tie up the shared database "
+            f"connection for everyone using the app, so it's blocked outright rather than just "
+            f"being slow. Narrow Grade or Season above and click Apply Filters again."
+        )
+        return
+
+    scoped_match_ids = tuple(str(m) for m in valid_match_ids)
+    bowling_df = get_bowling_innings_for_matches(scoped_match_ids)
+    if bowling_df.empty:
+        st.info("No bowling data available for the current Grade/Match type/Season.")
+        return
+    bowling_df = add_season_column(bowling_df, "day_1_start")
+
+    # ---------------------------------------------------------------
+    # Bowling type / Bowling style / Batter hand (own) / Opponent --
+    # only computed/shown AFTER Apply Filters, since they depend on the
+    # scoped fetch above. Once loaded, all four stay live (no need to
+    # click Apply again) since they only ever narrow the match set
+    # further, never past the cap already enforced above.
+    # ---------------------------------------------------------------
+    stage_df = bowling_df.copy()
 
     pace_spin_options = sorted(stage_df["pace_spin"].dropna().unique().tolist())
     selected_pace_spin = cascading_multiselect(
@@ -296,7 +328,6 @@ def bowling_tab():
         st.warning("No bowling records match the current filters.")
         return
 
-    # ---------------- Summary table (whole-innings figures from player_innings) ----------------
     filtered = filtered.copy()
     filtered["balls_bowled"] = filtered["overs"].apply(overs_to_balls)
 
@@ -308,10 +339,6 @@ def bowling_tab():
         balls_bowled=("balls_bowled", "sum"),
     ).reset_index()
 
-    # Fours/sixes conceded don't exist on player_innings for bowling rows --
-    # pull them from the pre-aggregated (server-side GROUP BY) deliveries
-    # summary, scoped down to exactly the match/innings rows currently in
-    # `filtered` so it still respects every sidebar filter.
     conceded_df = get_bowling_conceded_summary()
     if not conceded_df.empty:
         scope_keys = filtered[["match_id", "innings_id", "player_id"]].rename(
@@ -395,20 +422,18 @@ def bowling_tab():
         f"{selected_row['economy']:.2f}" if pd.notna(selected_row["economy"]) else "\u2013",
     )
 
-    # No ball-segment breakdown for bowling (no equivalent requested).
-
     deliveries_df = get_deliveries_for_bowler(str(selected_bowler_id))
     if not deliveries_df.empty:
         deliveries_df = _prep_bowling_deliveries(deliveries_df)
-        # Batter-hand-of-the-batter-FACED, joined onto deliveries via
-        # batter_id -- this is player_style joined a second time, under a
-        # different key, from the same table used for the bowler's own
-        # attributes up in get_bowling_innings().
         batter_style_lookup = get_player_style()[["player_id", "batter_hand"]].rename(
             columns={"player_id": "batter_id", "batter_hand": "faced_batter_hand"}
         )
         deliveries_df = deliveries_df.merge(batter_style_lookup, on="batter_id", how="left")
         deliveries_df["faced_batter_hand"] = deliveries_df["faced_batter_hand"].fillna("Unknown")
+        # get_deliveries_for_bowler returns this bowler's WHOLE history --
+        # restrict to the current Grade/Match type/Season/style/opponent
+        # scope, same as the Batting tab does for its single-player fetch.
+        deliveries_df = deliveries_df[deliveries_df["match_id"].isin(valid_match_ids)]
 
     # ---------------- Bowling vs batter hand ----------------
     st.subheader("Bowling vs batter hand (deliveries)")
@@ -533,8 +558,6 @@ def bowling_tab():
     if wicket_df.empty:
         st.info("No dismissal data available.")
     else:
-        # Population = every dismissal off a bowler whose innings are in the
-        # currently-filtered population_df's match/innings scope.
         pop_scope_keys = population_df[["match_id", "innings_id"]].drop_duplicates()
         pop_wickets = wicket_df.merge(pop_scope_keys, on=["match_id", "innings_id"], how="inner")
         pop_wickets = pop_wickets[pop_wickets["dismissal_type"].apply(is_countable_dismissal)]
@@ -580,8 +603,6 @@ def bowling_tab():
             )
             st.plotly_chart(fig_comp, width="stretch")
             st.dataframe(comp_df, width="stretch")
-
-    # No "Distribution of innings scores" section -- no batting equivalent for bowling.
 
     # ---------------- Boundary rate vs population ----------------
     st.subheader("Boundary rate vs population (conceded)")
@@ -638,7 +659,10 @@ def bowling_tab():
     if deliveries_df.empty:
         st.info("No delivery data available for this bowler.")
     else:
-        batting_pi = get_batting_innings()
+        # Scoped to the same match set as everything else on this page --
+        # NOT the whole-history get_batting_innings(), which was the other
+        # unbounded fetch on this tab before this update.
+        batting_pi = get_batting_innings_for_matches(scoped_match_ids)
         if batting_pi.empty:
             st.info("Batting position lookup unavailable right now.")
         else:
@@ -667,7 +691,6 @@ def bowling_tab():
         by_game_type = _bowling_metrics(gt_deliveries, "match_type")
         _render_metrics_table(by_game_type, "match_type", "Game type")
 
-        # ---------------- One Day phase breakdown ----------------
         od_deliveries = gt_deliveries[gt_deliveries["match_type"] == "One Day"].copy()
         if od_deliveries.empty:
             st.caption("No One Day deliveries for this bowler \u2014 phase report skipped.")
@@ -744,6 +767,7 @@ def bowling_tab():
                 or st.session_state["selected_bowl_highlight_id"] not in h_sorted["highlight_id"].values
             ):
                 st.session_state["selected_bowl_highlight_id"] = default_id
+                st.session_state["bowl_highlight_autoplay"] = False
 
             list_col, video_col = st.columns([3, 2])
 
@@ -769,6 +793,7 @@ def bowling_tab():
                         with row_btn_col:
                             if st.button("\u25b6", key=f"bowl_play_{hl_id}"):
                                 st.session_state["selected_bowl_highlight_id"] = hl_id
+                                st.session_state["bowl_highlight_autoplay"] = True
                         st.divider()
 
             with video_col:
@@ -778,6 +803,7 @@ def bowling_tab():
                 st.markdown(f"**{selected_highlight.get('description', '')}**")
                 url = selected_highlight.get("highlight_url")
                 if url:
-                    st.video(url, autoplay=True)
+                    autoplay = st.session_state.pop("bowl_highlight_autoplay", False)
+                    st.video(url, autoplay=autoplay)
                 else:
                     st.info("No video URL available for this highlight.")
