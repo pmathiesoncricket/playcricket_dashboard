@@ -607,11 +607,13 @@ def get_batter_summary():
 
 @st.cache_data(ttl=300)
 def get_bowler_teams():
-    """player_id -> array of distinct team NAMES they've bowled for,
+    """bowler_id -> array of distinct team NAMES they've bowled for,
     sourced from player_innings.team (role='bowling') -- powers the Team
-    filter on the Bowler Style tab."""
+    filter on the Bowler Style tab. Column is aliased to bowler_id (not
+    just player_id) so it merges directly onto get_bowler_summary()'s
+    bowler_id without a rename step in the caller."""
     sql = """
-        SELECT player_id, array_agg(DISTINCT team) AS teams
+        SELECT player_id AS bowler_id, array_agg(DISTINCT team) AS teams
         FROM player_innings
         WHERE role = 'bowling' AND team IS NOT NULL
         GROUP BY player_id
@@ -622,11 +624,13 @@ def get_bowler_teams():
 
 @st.cache_data(ttl=300)
 def get_batter_teams():
-    """player_id -> array of distinct team NAMES they've batted for,
+    """batter_id -> array of distinct team NAMES they've batted for,
     sourced from player_innings.team (role='batting') -- powers the Team
-    filter on the Batter Style tab."""
+    filter on the Batter Style tab. Column is aliased to batter_id (not
+    just player_id) so it merges directly onto get_batter_summary()'s
+    batter_id without a rename step in the caller."""
     sql = """
-        SELECT player_id, array_agg(DISTINCT team) AS teams
+        SELECT player_id AS batter_id, array_agg(DISTINCT team) AS teams
         FROM player_innings
         WHERE role = 'batting' AND team IS NOT NULL
         GROUP BY player_id
