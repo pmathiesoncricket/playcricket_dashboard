@@ -26,6 +26,22 @@ MAX_HIGHLIGHTS_STEP = 10
 BATTERS_PER_PAGE = 20
 
 
+def _as_list(x):
+    """
+    Normalizes a Postgres array_agg() result to a plain Python list for
+    safe iteration. After a LEFT JOIN, any batter with no matching row
+    (e.g. get_batter_teams() found no player_innings row with role=
+    'batting' and a populated team) gets NaN in that column instead of an
+    empty list -- and `nan or []` evaluates to nan itself (bool(nan) is
+    True), so `for t in (nan or [])` throws "float object is not
+    iterable". This catches that case (and any other non-list value)
+    before iteration ever happens. This hasn't been observed failing on
+    this specific tab yet, but the same LEFT JOIN pattern caused exactly
+    this crash on the Bowler Style tab, so it's applied here pre-emptively.
+    """
+    return x if isinstance(x, list) else []
+
+
 def batter_style_tab():
     st.header("Batter Style")
     st.caption(
@@ -46,8 +62,8 @@ def batter_style_tab():
     teams_df = get_batter_teams()
     batter_summary = batter_summary.merge(teams_df, on="batter_id", how="left")
 
-    all_grades = sorted({g for grades in batter_summary["grades"] for g in (grades or []) if g})
-    all_teams = sorted({t for teams in batter_summary["teams"] for t in (teams or []) if t})
+    all_grades = sorted({g for grades in batter_summary["grades"] for g in _as_list(grades) if g})
+    all_teams = sorted({t for teams in batter_summary["teams"] for t in _as_list(teams) if t})
     all_batters = sorted(batter_summary["batter_name"].dropna().unique().tolist())
 
     filt_col1, filt_col2 = st.columns([2, 1])
@@ -72,11 +88,11 @@ def batter_style_tab():
 
     if selected_grade:
         batter_summary = batter_summary[
-            batter_summary["grades"].apply(lambda g: any(x in selected_grade for x in (g or [])))
+            batter_summary["grades"].apply(lambda g: any(x in selected_grade for x in _as_list(g)))
         ]
     if selected_team:
         batter_summary = batter_summary[
-            batter_summary["teams"].apply(lambda t: any(x in selected_team for x in (t or [])))
+            batter_summary["teams"].apply(lambda t: any(x in selected_team for x in _as_list(t)))
         ]
     if selected_batter_names:
         batter_summary = batter_summary[batter_summary["batter_name"].isin(selected_batter_names)]
