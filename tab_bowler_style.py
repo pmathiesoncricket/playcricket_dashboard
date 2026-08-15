@@ -4,12 +4,30 @@ import pandas as pd
 from sqlalchemy import text
 
 from db import (
-    conn, get_matches, get_bowler_summary, get_player_style, get_highlights_for_bowlers,
+    conn, get_matches, get_bowler_summary, get_bowler_teams, get_player_style,
+    get_highlights_for_bowlers, get_ball_times,
 )
+from helpers import cascading_multiselect
+from tab_batting import resolve_ball_video_url
 
 PACE_SPIN_OPTIONS = ["Pace", "Spin"]
 BOWL_HAND_OPTIONS = ["Right", "Left"]
 BOWL_STYLE_OPTIONS = ["Right Pace", "Left Pace", "LAOS", "Off Spin", "Leg Spin"]
+
+# If a row's bowl_style is being set/changed and pace_spin/bowl_hand are
+# LEFT BLANK, inherit the conventional values below rather than leaving
+# them empty. Never overwrites a value the user explicitly chose. Note
+# the assumption baked in here: with no left-arm-wrist-spin ("chinaman")
+# option in BOWL_STYLE_OPTIONS, Off Spin and Leg Spin both conventionally
+# imply a RIGHT-arm bowler within this specific option set.
+BOWL_STYLE_INFERENCE = {
+    "Right Pace": ("Pace", "Right"),
+    "Left Pace": ("Pace", "Left"),
+    "LAOS": ("Spin", "Left"),
+    "Off Spin": ("Spin", "Right"),
+    "Leg Spin": ("Spin", "Right"),
+}
+
 # Explicit placeholder for "no value" -- always sorted/inserted at index 0,
 # so a genuinely blank/NULL field renders as blank in the dropdown instead
 # of silently landing on whichever real option is alphabetically first.
@@ -19,7 +37,7 @@ BOWL_STYLE_OPTIONS = ["Right Pace", "Left Pace", "LAOS", "Off Spin", "Leg Spin"]
 # "explicitly chose the first option".
 BLANK_OPTION = "\u2014"
 ROW_DIVIDER = "<hr style='margin:2px 0;border:none;border-top:1px solid #333'>"
-MAX_HIGHLIGHTS = 10
+MAX_HIGHLIGHTS_STEP = 10
 BOWLERS_PER_PAGE = 20
 
 
@@ -27,7 +45,8 @@ def bowler_style_tab():
     st.header("Bowler Style")
     st.caption(
         "Review bowlers with missing style data, in pages of 20. "
-        "Each page preloads up to 10 highlights per visible bowler."
+        "Each page preloads up to 10 highlights per visible bowler (use "
+        "\"Show more highlights\" below the list to load additional ones)."
     )
 
     bowler_summary = get_bowler_summary()
@@ -39,21 +58,43 @@ def bowler_style_tab():
     matches_df["day_1_start"] = pd.to_datetime(matches_df["day_1_start"])
 
     style_df = get_player_style()
+    teams_df = get_bowler_teams()
+    bowler_summary = bowler_summary.merge(teams_df, on="bowler_id", how="left")
 
     all_grades = sorted({g for grades in bowler_summary["grades"] for g in (grades or []) if g})
+    all_teams = sorted({t for teams in bowler_summary["teams"] for t in (teams or []) if t})
+    all_bowlers = sorted(bowler_summary["bowler_name"].dropna().unique().tolist())
 
     filt_col1, filt_col2 = st.columns([2, 1])
     with filt_col1:
-        selected_grade = st.multiselect("Grade", all_grades, default=[], key="bowler_filter_grade")
+        selected_grade = cascading_multiselect(
+            filt_col1, "Grade", all_grades, "bowler_filter_grade", enable_quick_add=True
+        )
     with filt_col2:
         style_status = st.selectbox(
             "Bowl style", ["All", "Populated", "Unpopulated"], index=2, key="bowler_filter_style_status"
+        )
+
+    filt_col3, filt_col4 = st.columns(2)
+    with filt_col3:
+        selected_team = cascading_multiselect(
+            filt_col3, "Team", all_teams, "bowler_filter_team", enable_quick_add=True
+        )
+    with filt_col4:
+        selected_bowler_names = cascading_multiselect(
+            filt_col4, "Player", all_bowlers, "bowler_filter_player"
         )
 
     if selected_grade:
         bowler_summary = bowler_summary[
             bowler_summary["grades"].apply(lambda g: any(x in selected_grade for x in (g or [])))
         ]
+    if selected_team:
+        bowler_summary = bowler_summary[
+            bowler_summary["teams"].apply(lambda t: any(x in selected_team for x in (t or [])))
+        ]
+    if selected_bowler_names:
+        bowler_summary = bowler_summary[bowler_summary["bowler_name"].isin(selected_bowler_names)]
 
     if bowler_summary.empty:
         st.info("No bowling deliveries match the current filters.")
@@ -94,7 +135,6 @@ def bowler_style_tab():
 
     st.caption(f"{total_bowlers} bowlers \u2014 page {current_page + 1} of {total_pages} (showing {len(page_df)})")
 
-    # BLANK_OPTION is always first -- represents "no value" / NULL.
     pace_spin_opts = [BLANK_OPTION] + sorted(
         set(PACE_SPIN_OPTIONS) | set(style_df["pace_spin"].dropna().unique().tolist())
     )
@@ -112,9 +152,6 @@ def bowler_style_tab():
         st.session_state["selected_bowler_id"] = page_df.iloc[0]["bowler_id"]
 
     def dropdown_index(options, current_value):
-        """Index of `current_value` in `options`, or 0 (BLANK_OPTION) if the
-        value is missing/None/NaN -- i.e. genuinely unpopulated stays blank
-        rather than defaulting to whichever real option sorts first."""
         if pd.notna(current_value) and current_value in options:
             return options.index(current_value)
         return 0
@@ -129,6 +166,17 @@ def bowler_style_tab():
             new_pace_spin = None if (not ps_val or ps_val == BLANK_OPTION) else ps_val
             new_bowl_hand = None if (not hand_val or hand_val == BLANK_OPTION) else hand_val
             new_bowl_style = None if (not style_val or style_val == BLANK_OPTION) else style_val
+
+            # Inherit pace_spin/bowl_hand from bowl_style ONLY where the
+            # user left that specific field blank -- never overrides an
+            # explicit choice.
+            if new_bowl_style in BOWL_STYLE_INFERENCE:
+                inferred_pace_spin, inferred_hand = BOWL_STYLE_INFERENCE[new_bowl_style]
+                if new_pace_spin is None:
+                    new_pace_spin = inferred_pace_spin
+                if new_bowl_hand is None:
+                    new_bowl_hand = inferred_hand
+
             orig_pace_spin = row.get("pace_spin") if pd.notna(row.get("pace_spin")) else None
             orig_bowl_hand = row.get("bowl_hand") if pd.notna(row.get("bowl_hand")) else None
             orig_bowl_style = row.get("bowl_style") if pd.notna(row.get("bowl_style")) else None
@@ -161,14 +209,33 @@ def bowler_style_tab():
         get_player_style.clear()
         return len(changed)
 
-    page_cache_key = (current_page, tuple(selected_grade), style_status, page_bowler_ids_str)
+    # Highlight limit for the currently-selected bowler grows by
+    # MAX_HIGHLIGHTS_STEP each time "Show more highlights" is clicked, and
+    # resets back to the base amount whenever a different bowler is
+    # selected (tracked separately per bowler_id so flipping between two
+    # bowlers doesn't lose either one's expanded count).
+    if "bowler_highlight_limits" not in st.session_state:
+        st.session_state["bowler_highlight_limits"] = {}
+    current_limit = st.session_state["bowler_highlight_limits"].get(
+        str(st.session_state["selected_bowler_id"]), MAX_HIGHLIGHTS_STEP
+    )
+
+    page_cache_key = (current_page, tuple(selected_grade), tuple(selected_team), tuple(selected_bowler_names), style_status, page_bowler_ids_str, current_limit)
     if st.session_state.get("bowler_highlights_page_key") != page_cache_key:
-        page_highlights = get_highlights_for_bowlers(page_bowler_ids_str, max_per_bowler=MAX_HIGHLIGHTS)
+        page_highlights = get_highlights_for_bowlers(page_bowler_ids_str, max_per_bowler=current_limit)
         if not page_highlights.empty:
             page_highlights = page_highlights.merge(
-                matches_df[["match_id", "day_1_start", "home_team"]], on="match_id", how="left"
+                matches_df[["match_id", "day_1_start", "home_team", "day1_stream_url", "day1_stream_start",
+                            "day2_stream_url", "day2_stream_start"]],
+                on="match_id", how="left",
             )
             page_highlights["day_1_start"] = pd.to_datetime(page_highlights["day_1_start"])
+            ball_ids = tuple(page_highlights["ball_id"].dropna().astype(str).unique())
+            ball_times = get_ball_times(ball_ids)
+            if not ball_times.empty:
+                page_highlights = page_highlights.merge(ball_times, on="ball_id", how="left")
+            else:
+                page_highlights["ball_time"] = None
         st.session_state["bowler_highlights_page_df"] = page_highlights
         st.session_state["bowler_highlights_page_key"] = page_cache_key
         st.session_state.pop("selected_bowler_highlight_id", None)
@@ -179,16 +246,6 @@ def bowler_style_tab():
     list_col, highlight_col = st.columns([2, 3])
 
     with list_col:
-        # FIX: every button that needs to see the latest dropdown edits --
-        # including Prev/Next/Save -- must be an st.form_submit_button
-        # INSIDE this same form. Streamlit only syncs a form's widgets into
-        # st.session_state when one of ITS OWN submit buttons is clicked;
-        # a plain st.button() outside the form triggers a rerun without
-        # pulling in any pending edits from inside it. That mismatch was
-        # exactly why the last-touched dropdown wouldn't save unless you
-        # clicked "Show highlights" (a submit button) on some other row
-        # first -- that click happened to sync everything, a direct
-        # Prev/Next/Save click didn't.
         with st.form("bowler_styles_form", clear_on_submit=False):
             nav1, nav2, nav3 = st.columns([1, 1, 2])
             with nav1:
@@ -238,9 +295,6 @@ def bowler_style_tab():
                         )
                     st.markdown(ROW_DIVIDER, unsafe_allow_html=True)
 
-        # Everything below runs AFTER the form block closes, so by this
-        # point st.session_state has the fully up-to-date value of every
-        # dropdown regardless of which button was clicked.
         if prev_page_clicked:
             try:
                 saved_count = save_changed_rows(page_df)
@@ -289,7 +343,6 @@ def bowler_style_tab():
             return
         selected_row = selected_row.iloc[0]
         selected_bowler_id_str = str(selected_row["bowler_id"])
-        st.subheader(f"Highlights \u2014 {selected_row['bowler_name']}")
 
         if page_highlights_df.empty:
             st.info("No highlights available for bowlers on this page.")
@@ -317,7 +370,7 @@ def bowler_style_tab():
         with st.container(height=list_height):
             for _, h_row in bh_sorted.iterrows():
                 hid = h_row["highlight_id"]
-                txt_col, btn_col = st.columns([5, 1])
+                txt_col, play_col, yt_col = st.columns([4, 1, 1])
                 with txt_col:
                     date_str = (
                         h_row["day_1_start"].strftime("%d %b %Y") if pd.notna(h_row.get("day_1_start")) else ""
@@ -329,13 +382,27 @@ def bowler_style_tab():
                         f"<span style='color:gray;font-size:0.8em'>{date_str} {home_team}</span>",
                         unsafe_allow_html=True,
                     )
-                with btn_col:
+                with play_col:
                     if st.button("Play", key=f"bowler_hl_play_{hid}"):
                         st.session_state["selected_bowler_highlight_id"] = hid
+                with yt_col:
+                    yt_url = resolve_ball_video_url(
+                        h_row.get("ball_time"), h_row.get("day1_stream_url"), h_row.get("day1_stream_start"),
+                        h_row.get("day2_stream_url"), h_row.get("day2_stream_start"),
+                    )
+                    if yt_url:
+                        st.link_button("YouTube", yt_url)
+                    else:
+                        st.button("YouTube", key=f"bowler_hl_yt_disabled_{hid}", disabled=True)
                 st.markdown(ROW_DIVIDER, unsafe_allow_html=True)
 
+        show_more_clicked = st.button("Show more highlights", key="bowler_show_more_highlights")
+        if show_more_clicked:
+            limits = st.session_state["bowler_highlight_limits"]
+            limits[selected_bowler_id_str] = limits.get(selected_bowler_id_str, MAX_HIGHLIGHTS_STEP) + MAX_HIGHLIGHTS_STEP
+            st.rerun()
+
         sel_h = bh_sorted[bh_sorted["highlight_id"] == st.session_state["selected_bowler_highlight_id"]].iloc[0]
-        st.markdown(f"**{sel_h.get('description')}**")
         url = sel_h.get("highlight_url")
         if url:
             st.video(url, autoplay=True)
