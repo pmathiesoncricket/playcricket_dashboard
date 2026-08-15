@@ -291,21 +291,11 @@ def get_wicketkeepers_for_matches(match_ids: tuple[str, ...]):
 def get_match_results():
     """
     Parses matches.result_text into a structured winner_team_id +
-    outcome_type per match. result_text consistently follows the pattern
-    "<winning team name> won by <margin>" (also seen: "won by forfeit",
-    "won" with no margin, "Won on disqualification"), plus special cases
-    "Match drawn", "Match tied", "Result pending", and "<team> trails by
-    <N>" (an unfinished/abandoned two-day match sitting mid-way, treated
-    as no_result since it isn't a concluded outcome).
-
-    outcome_type is one of:
-      'decisive'  -- winner_team_id is populated
-      'draw', 'tie', 'no_result' -- winner_team_id is None
-      'unparsed'  -- the winning team name in result_text didn't match
-                     either home_team or away_team (name mismatch/typo);
-                     winner_team_id is None. Kept as its own bucket rather
-                     than silently lumped into no_result, so it can be
-                     surfaced/audited if it ever shows up in volume.
+    outcome_type per match. See prior implementation notes: handles
+    "<team> won by <margin>", "won by forfeit", "won" with no margin,
+    "Won on disqualification", "Match drawn", "Match tied",
+    "Result pending", and "<team> trails by <N>" (unfinished two-day
+    match, treated as no_result).
     """
     m = get_matches()[["match_id", "home_team_id", "home_team", "away_team_id", "away_team", "result_text"]].copy()
     if m.empty:
@@ -505,6 +495,35 @@ def get_deliveries_for_matches(match_ids: tuple[str, ...]):
 
 
 @st.cache_data(ttl=300)
+def get_ball_times(ball_ids: tuple[str, ...]):
+    """
+    ball_id -> ball_time lookup for a specific set of deliveries. Powers
+    the "YouTube" button on the Batter/Bowler Style highlight lists --
+    highlights.ball_time isn't stored on the highlights row itself, only
+    over/ball_number, so this joins back to deliveries (via the ball_id
+    foreign key already on each highlight) to get the true timestamp
+    needed for build_timestamped_youtube_url(). A highlight's ball_id can
+    be NULL (deliveries.ball_id ON DELETE SET NULL), in which case it
+    simply won't appear in the result and the caller should treat that
+    highlight as having no YouTube link available.
+    """
+    if not ball_ids:
+        return pd.DataFrame()
+
+    params = {}
+    placeholders = []
+    for i, bid in enumerate(ball_ids):
+        key = f"bid_{i}"
+        placeholders.append(f":{key}")
+        params[key] = bid
+    in_sql = ", ".join(placeholders)
+
+    sql = f"SELECT ball_id, ball_time FROM deliveries WHERE ball_id IN ({in_sql})"
+    df = _query_with_retry(sql, params=params, ttl=0)
+    return _stringify_uuids(df)
+
+
+@st.cache_data(ttl=300)
 def get_batting_deliveries_summary(match_ids: tuple[str, ...]):
     """Server-side pre-aggregation of deliveries for the Batting tab's
     per-batter summary table (one row per match/innings/batting-team/
@@ -581,6 +600,36 @@ def get_batter_summary():
         LEFT JOIN matches m ON m.match_id = d.match_id
         WHERE d.batter_id IS NOT NULL
         GROUP BY d.batter_id
+    """
+    df = _query_with_retry(sql, ttl=0)
+    return _stringify_uuids(df)
+
+
+@st.cache_data(ttl=300)
+def get_bowler_teams():
+    """player_id -> array of distinct team NAMES they've bowled for,
+    sourced from player_innings.team (role='bowling') -- powers the Team
+    filter on the Bowler Style tab."""
+    sql = """
+        SELECT player_id, array_agg(DISTINCT team) AS teams
+        FROM player_innings
+        WHERE role = 'bowling' AND team IS NOT NULL
+        GROUP BY player_id
+    """
+    df = _query_with_retry(sql, ttl=0)
+    return _stringify_uuids(df)
+
+
+@st.cache_data(ttl=300)
+def get_batter_teams():
+    """player_id -> array of distinct team NAMES they've batted for,
+    sourced from player_innings.team (role='batting') -- powers the Team
+    filter on the Batter Style tab."""
+    sql = """
+        SELECT player_id, array_agg(DISTINCT team) AS teams
+        FROM player_innings
+        WHERE role = 'batting' AND team IS NOT NULL
+        GROUP BY player_id
     """
     df = _query_with_retry(sql, ttl=0)
     return _stringify_uuids(df)
