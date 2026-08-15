@@ -31,14 +31,24 @@ BOWL_STYLE_INFERENCE = {
 # Explicit placeholder for "no value" -- always sorted/inserted at index 0,
 # so a genuinely blank/NULL field renders as blank in the dropdown instead
 # of silently landing on whichever real option is alphabetically first.
-# Without this, saving a page you hadn't touched could actually WRITE a
-# real value over every NULL row, since a selectbox always has SOME option
-# selected and there was no way to tell "still blank" apart from
-# "explicitly chose the first option".
 BLANK_OPTION = "\u2014"
 ROW_DIVIDER = "<hr style='margin:2px 0;border:none;border-top:1px solid #333'>"
 MAX_HIGHLIGHTS_STEP = 10
 BOWLERS_PER_PAGE = 20
+
+
+def _as_list(x):
+    """
+    Normalizes a Postgres array_agg() result to a plain Python list for
+    safe iteration. After a LEFT JOIN, any bowler with no matching row
+    (e.g. get_bowler_teams() found no player_innings row with role=
+    'bowling' and a populated team) gets NaN in that column instead of an
+    empty list -- and `nan or []` evaluates to nan itself (bool(nan) is
+    True), so `for t in (nan or [])` throws "float object is not
+    iterable". This catches that case (and any other non-list value)
+    before iteration ever happens.
+    """
+    return x if isinstance(x, list) else []
 
 
 def bowler_style_tab():
@@ -61,8 +71,8 @@ def bowler_style_tab():
     teams_df = get_bowler_teams()
     bowler_summary = bowler_summary.merge(teams_df, on="bowler_id", how="left")
 
-    all_grades = sorted({g for grades in bowler_summary["grades"] for g in (grades or []) if g})
-    all_teams = sorted({t for teams in bowler_summary["teams"] for t in (teams or []) if t})
+    all_grades = sorted({g for grades in bowler_summary["grades"] for g in _as_list(grades) if g})
+    all_teams = sorted({t for teams in bowler_summary["teams"] for t in _as_list(teams) if t})
     all_bowlers = sorted(bowler_summary["bowler_name"].dropna().unique().tolist())
 
     filt_col1, filt_col2 = st.columns([2, 1])
@@ -87,11 +97,11 @@ def bowler_style_tab():
 
     if selected_grade:
         bowler_summary = bowler_summary[
-            bowler_summary["grades"].apply(lambda g: any(x in selected_grade for x in (g or [])))
+            bowler_summary["grades"].apply(lambda g: any(x in selected_grade for x in _as_list(g)))
         ]
     if selected_team:
         bowler_summary = bowler_summary[
-            bowler_summary["teams"].apply(lambda t: any(x in selected_team for x in (t or [])))
+            bowler_summary["teams"].apply(lambda t: any(x in selected_team for x in _as_list(t)))
         ]
     if selected_bowler_names:
         bowler_summary = bowler_summary[bowler_summary["bowler_name"].isin(selected_bowler_names)]
