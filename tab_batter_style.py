@@ -4,8 +4,11 @@ import pandas as pd
 from sqlalchemy import text
 
 from db import (
-    conn, get_matches, get_batter_summary, get_player_style, get_highlights_for_batters,
+    conn, get_matches, get_batter_summary, get_batter_teams, get_player_style,
+    get_highlights_for_batters, get_ball_times,
 )
+from helpers import cascading_multiselect
+from tab_batting import resolve_ball_video_url
 
 # This tab is a deliberate mirror of tab_bowler_style.py's layout and
 # save/pagination mechanics -- same page size, same "form + scrollable
@@ -19,7 +22,7 @@ from db import (
 BATTER_HAND_OPTIONS = ["Right", "Left"]
 BLANK_OPTION = "\u2014"
 ROW_DIVIDER = "<hr style='margin:2px 0;border:none;border-top:1px solid #333'>"
-MAX_HIGHLIGHTS = 10
+MAX_HIGHLIGHTS_STEP = 10
 BATTERS_PER_PAGE = 20
 
 
@@ -27,7 +30,8 @@ def batter_style_tab():
     st.header("Batter Style")
     st.caption(
         "Review batters with missing batting-hand data, in pages of 20. "
-        "Each page preloads up to 10 highlights per visible batter."
+        "Each page preloads up to 10 highlights per visible batter (use "
+        "\"Show more highlights\" below the list to load additional ones)."
     )
 
     batter_summary = get_batter_summary()
@@ -39,21 +43,43 @@ def batter_style_tab():
     matches_df["day_1_start"] = pd.to_datetime(matches_df["day_1_start"])
 
     style_df = get_player_style()
+    teams_df = get_batter_teams()
+    batter_summary = batter_summary.merge(teams_df, on="batter_id", how="left")
 
     all_grades = sorted({g for grades in batter_summary["grades"] for g in (grades or []) if g})
+    all_teams = sorted({t for teams in batter_summary["teams"] for t in (teams or []) if t})
+    all_batters = sorted(batter_summary["batter_name"].dropna().unique().tolist())
 
     filt_col1, filt_col2 = st.columns([2, 1])
     with filt_col1:
-        selected_grade = st.multiselect("Grade", all_grades, default=[], key="batter_filter_grade")
+        selected_grade = cascading_multiselect(
+            filt_col1, "Grade", all_grades, "batter_filter_grade", enable_quick_add=True
+        )
     with filt_col2:
         hand_status = st.selectbox(
             "Batter hand", ["All", "Populated", "Unpopulated"], index=2, key="batter_filter_hand_status"
+        )
+
+    filt_col3, filt_col4 = st.columns(2)
+    with filt_col3:
+        selected_team = cascading_multiselect(
+            filt_col3, "Team", all_teams, "batter_filter_team", enable_quick_add=True
+        )
+    with filt_col4:
+        selected_batter_names = cascading_multiselect(
+            filt_col4, "Player", all_batters, "batter_filter_player"
         )
 
     if selected_grade:
         batter_summary = batter_summary[
             batter_summary["grades"].apply(lambda g: any(x in selected_grade for x in (g or [])))
         ]
+    if selected_team:
+        batter_summary = batter_summary[
+            batter_summary["teams"].apply(lambda t: any(x in selected_team for x in (t or [])))
+        ]
+    if selected_batter_names:
+        batter_summary = batter_summary[batter_summary["batter_name"].isin(selected_batter_names)]
 
     if batter_summary.empty:
         st.info("No batting deliveries match the current filters.")
@@ -143,14 +169,28 @@ def batter_style_tab():
         get_player_style.clear()
         return len(changed)
 
-    page_cache_key = (current_page, tuple(selected_grade), hand_status, page_batter_ids_str)
+    if "batter_highlight_limits" not in st.session_state:
+        st.session_state["batter_highlight_limits"] = {}
+    current_limit = st.session_state["batter_highlight_limits"].get(
+        str(st.session_state["selected_batter_id"]), MAX_HIGHLIGHTS_STEP
+    )
+
+    page_cache_key = (current_page, tuple(selected_grade), tuple(selected_team), tuple(selected_batter_names), hand_status, page_batter_ids_str, current_limit)
     if st.session_state.get("batter_highlights_page_key") != page_cache_key:
-        page_highlights = get_highlights_for_batters(page_batter_ids_str, max_per_batter=MAX_HIGHLIGHTS)
+        page_highlights = get_highlights_for_batters(page_batter_ids_str, max_per_batter=current_limit)
         if not page_highlights.empty:
             page_highlights = page_highlights.merge(
-                matches_df[["match_id", "day_1_start", "home_team"]], on="match_id", how="left"
+                matches_df[["match_id", "day_1_start", "home_team", "day1_stream_url", "day1_stream_start",
+                            "day2_stream_url", "day2_stream_start"]],
+                on="match_id", how="left",
             )
             page_highlights["day_1_start"] = pd.to_datetime(page_highlights["day_1_start"])
+            ball_ids = tuple(page_highlights["ball_id"].dropna().astype(str).unique())
+            ball_times = get_ball_times(ball_ids)
+            if not ball_times.empty:
+                page_highlights = page_highlights.merge(ball_times, on="ball_id", how="left")
+            else:
+                page_highlights["ball_time"] = None
         st.session_state["batter_highlights_page_df"] = page_highlights
         st.session_state["batter_highlights_page_key"] = page_cache_key
         st.session_state.pop("selected_batter_highlight_id", None)
@@ -161,16 +201,6 @@ def batter_style_tab():
     list_col, highlight_col = st.columns([2, 3])
 
     with list_col:
-        # FIX: every button that needs to see the latest dropdown edits --
-        # including Prev/Next/Save -- must be an st.form_submit_button
-        # INSIDE this same form. Streamlit only syncs a form's widgets into
-        # st.session_state when one of ITS OWN submit buttons is clicked;
-        # a plain st.button() outside the form triggers a rerun without
-        # pulling in any pending edits from inside it. That mismatch was
-        # exactly why the last-touched dropdown wouldn't save unless you
-        # clicked "Show highlights" (a submit button) on some other row
-        # first -- that click happened to sync everything, a direct
-        # Prev/Next/Save click didn't.
         with st.form("batter_styles_form", clear_on_submit=False):
             nav1, nav2, nav3 = st.columns([1, 1, 2])
             with nav1:
@@ -208,9 +238,6 @@ def batter_style_tab():
                         )
                     st.markdown(ROW_DIVIDER, unsafe_allow_html=True)
 
-        # Everything below runs AFTER the form block closes, so by this
-        # point st.session_state has the fully up-to-date value of every
-        # dropdown regardless of which button was clicked.
         if prev_page_clicked:
             try:
                 saved_count = save_changed_rows(page_df)
@@ -259,7 +286,6 @@ def batter_style_tab():
             return
         selected_row = selected_row.iloc[0]
         selected_batter_id_str = str(selected_row["batter_id"])
-        st.subheader(f"Highlights \u2014 {selected_row['batter_name']}")
 
         if page_highlights_df.empty:
             st.info("No highlights available for batters on this page.")
@@ -287,7 +313,7 @@ def batter_style_tab():
         with st.container(height=list_height):
             for _, h_row in bh_sorted.iterrows():
                 hid = h_row["highlight_id"]
-                txt_col, btn_col = st.columns([5, 1])
+                txt_col, play_col, yt_col = st.columns([4, 1, 1])
                 with txt_col:
                     date_str = (
                         h_row["day_1_start"].strftime("%d %b %Y") if pd.notna(h_row.get("day_1_start")) else ""
@@ -299,13 +325,27 @@ def batter_style_tab():
                         f"<span style='color:gray;font-size:0.8em'>{date_str} {home_team}</span>",
                         unsafe_allow_html=True,
                     )
-                with btn_col:
+                with play_col:
                     if st.button("Play", key=f"batter_hl_play_{hid}"):
                         st.session_state["selected_batter_highlight_id"] = hid
+                with yt_col:
+                    yt_url = resolve_ball_video_url(
+                        h_row.get("ball_time"), h_row.get("day1_stream_url"), h_row.get("day1_stream_start"),
+                        h_row.get("day2_stream_url"), h_row.get("day2_stream_start"),
+                    )
+                    if yt_url:
+                        st.link_button("YouTube", yt_url)
+                    else:
+                        st.button("YouTube", key=f"batter_hl_yt_disabled_{hid}", disabled=True)
                 st.markdown(ROW_DIVIDER, unsafe_allow_html=True)
 
+        show_more_clicked = st.button("Show more highlights", key="batter_show_more_highlights")
+        if show_more_clicked:
+            limits = st.session_state["batter_highlight_limits"]
+            limits[selected_batter_id_str] = limits.get(selected_batter_id_str, MAX_HIGHLIGHTS_STEP) + MAX_HIGHLIGHTS_STEP
+            st.rerun()
+
         sel_h = bh_sorted[bh_sorted["highlight_id"] == st.session_state["selected_batter_highlight_id"]].iloc[0]
-        st.markdown(f"**{sel_h.get('description')}**")
         url = sel_h.get("highlight_url")
         if url:
             st.video(url, autoplay=True)
